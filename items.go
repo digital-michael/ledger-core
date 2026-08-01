@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -22,6 +24,7 @@ type Item struct {
 	Status      string
 	Label       sql.NullString
 	Priority    sql.NullInt64
+	Assignee    sql.NullString
 	CreatedAt   string
 	UpdatedAt   string
 }
@@ -36,14 +39,15 @@ type CreateItemParams struct {
 	Description string
 	Label       string
 	Priority    *int
+	Assignee    string
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, created_at, updated_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, created_at, updated_at`
 
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &it.Label, &it.Priority, &it.CreatedAt, &it.UpdatedAt)
+		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.CreatedAt, &it.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -71,10 +75,10 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?)`,
+		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, assignee, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		nullIfEmpty(p.Label), priority, now, now,
+		nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -117,6 +121,7 @@ type ItemFilter struct {
 	Type         string
 	ParentID     string
 	TopLevelOnly bool
+	Assignee     string
 }
 
 // ListItems returns items in a project matching the given filters, ordered
@@ -135,6 +140,10 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 	if f.Type != "" {
 		q += ` AND type = ?`
 		args = append(args, f.Type)
+	}
+	if f.Assignee != "" {
+		q += ` AND assignee = ?`
+		args = append(args, f.Assignee)
 	}
 	switch {
 	case f.ParentID != "":
@@ -187,6 +196,164 @@ func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, e
 
 	detail, _ := json.Marshal(map[string]string{"from": oldStatus, "to": status})
 	if err := insertAudit(ctx, tx, "item", id, "status_changed", string(detail)); err != nil {
+		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return db.GetItem(ctx, id)
+}
+
+// UpdateItemPriority changes an item's priority and records the before/after
+// values in audit_log, in the same transaction as the update.
+func (db *DB) UpdateItemPriority(ctx context.Context, id string, priority int) (*Item, error) {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var oldPriority sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT priority FROM items WHERE id = ?`, id).Scan(&oldPriority)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("item %q not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+
+	now := nowUTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE items SET priority = ?, updated_at = ? WHERE id = ?`, priority, now, id); err != nil {
+		return nil, fmt.Errorf("updating priority: %w", err)
+	}
+
+	oldVal := "(none)"
+	if oldPriority.Valid {
+		oldVal = fmt.Sprintf("%d", oldPriority.Int64)
+	}
+	detail, _ := json.Marshal(map[string]string{"from": oldVal, "to": fmt.Sprintf("%d", priority)})
+	if err := insertAudit(ctx, tx, "item", id, "priority_changed", string(detail)); err != nil {
+		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return db.GetItem(ctx, id)
+}
+
+// UpdateItemParams is UpdateItem's per-field patch: nil means "leave this
+// field unchanged." At least one field must be set. Description/Label use
+// *string so an explicit empty string still clears them (nullIfEmpty, same
+// convention as every other free-text field) — nil is genuinely different
+// from "set to empty."
+type UpdateItemParams struct {
+	Title       *string
+	Description *string
+	Label       *string
+}
+
+// UpdateItem patches an item's title/description/label — whichever fields
+// are non-nil in p — and records exactly what changed (old/new per field)
+// in a single "updated" audit_log entry. A field whose new value equals its
+// current value is not recorded as a change and does not appear in the
+// UPDATE at all.
+func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error) {
+	if p.Title == nil && p.Description == nil && p.Label == nil {
+		return nil, errors.New("at least one of title, description, or label must be given")
+	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var oldTitle string
+	var oldDescription, oldLabel sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT title, description, label FROM items WHERE id = ?`, id).
+		Scan(&oldTitle, &oldDescription, &oldLabel)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("item %q not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+
+	changes := map[string][2]string{}
+	var setClauses []string
+	var args []any
+
+	if p.Title != nil && *p.Title != oldTitle {
+		changes["title"] = [2]string{oldTitle, *p.Title}
+		setClauses = append(setClauses, "title = ?")
+		args = append(args, *p.Title)
+	}
+	if p.Description != nil && *p.Description != oldDescription.String {
+		changes["description"] = [2]string{oldDescription.String, *p.Description}
+		setClauses = append(setClauses, "description = ?")
+		args = append(args, nullIfEmpty(*p.Description))
+	}
+	if p.Label != nil && *p.Label != oldLabel.String {
+		changes["label"] = [2]string{oldLabel.String, *p.Label}
+		setClauses = append(setClauses, "label = ?")
+		args = append(args, nullIfEmpty(*p.Label))
+	}
+
+	if len(setClauses) == 0 {
+		return db.GetItem(ctx, id)
+	}
+
+	now := nowUTC()
+	setClauses = append(setClauses, "updated_at = ?")
+	args = append(args, now, id)
+	q := "UPDATE items SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
+	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+		return nil, fmt.Errorf("updating item: %w", err)
+	}
+
+	detail, _ := json.Marshal(changes)
+	if err := insertAudit(ctx, tx, "item", id, "updated", string(detail)); err != nil {
+		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return db.GetItem(ctx, id)
+}
+
+// UpdateItemAssignee changes an item's assignee and records the before/after
+// values in audit_log, in the same transaction as the update. An empty
+// assignee clears it (unassigns), same as any other free-text field's
+// nullIfEmpty convention.
+func (db *DB) UpdateItemAssignee(ctx context.Context, id, assignee string) (*Item, error) {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var oldAssignee sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT assignee FROM items WHERE id = ?`, id).Scan(&oldAssignee)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("item %q not found", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+
+	now := nowUTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE items SET assignee = ?, updated_at = ? WHERE id = ?`, nullIfEmpty(assignee), now, id); err != nil {
+		return nil, fmt.Errorf("updating assignee: %w", err)
+	}
+
+	detail, _ := json.Marshal(map[string]string{"from": oldAssignee.String, "to": assignee})
+	if err := insertAudit(ctx, tx, "item", id, "assigned", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 

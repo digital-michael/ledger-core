@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -84,17 +85,52 @@ func (db *DB) GetOrCreateProjectForWrite(ctx context.Context, key, name string) 
 	return db.insertProject(ctx, key, name)
 }
 
+// insertProject creates a project row and records its creation in
+// audit_log within the same transaction — every other entity's creation
+// (item, note, resource, item_relation) is already audited this way;
+// project creation was the one gap, found during a 2026-08-01 CRUD+
+// integration completeness audit.
 func (db *DB) insertProject(ctx context.Context, key, name string) (*Project, error) {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	now := nowUTC()
 	id := uuid.NewString()
-	_, err := db.conn.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO projects (id, key, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		id, key, name, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating project %q: %w", key, err)
 	}
+
+	detail, _ := json.Marshal(map[string]string{"key": key, "name": name})
+	if err := insertAudit(ctx, tx, "project", id, "created", string(detail)); err != nil {
+		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
 	return &Project{ID: id, Key: key, Name: name}, nil
+}
+
+// GetProjectByID fetches a single project by its id, regardless of
+// deleted_at state — same lenient convention as GetItem's lookup-by-known-ID.
+func (db *DB) GetProjectByID(ctx context.Context, id string) (*Project, error) {
+	var p Project
+	err := db.conn.QueryRowContext(ctx, `SELECT id, key, name FROM projects WHERE id = ?`, id).Scan(&p.ID, &p.Key, &p.Name)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("project %q not found", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 // ListProjects returns every registered project, ordered by key.

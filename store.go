@@ -93,6 +93,10 @@ func Open() (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	if err := ensureColumn(conn, "items", "assignee", "TEXT"); err != nil {
+		conn.Close()
+		return nil, err
+	}
 
 	return &DB{conn: conn}, nil
 }
