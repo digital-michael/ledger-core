@@ -1,9 +1,14 @@
-// Package ledger provides the SQLite-backed persistence layer for the ledger
-// domain: connection setup, schema application, and typed query functions for
-// projects, items, resources, notes, item_relations, and audit_log.
+// Package ledger provides the ledger domain's persistence contract (Store)
+// plus its only implementation today: a SQLite-backed DB, built via
+// SQLiteFactory. Typed query functions for projects, items, resources,
+// notes, item_relations, and audit_log are defined against *DB throughout
+// this package; Store exists so a future MySQL/PostgreSQL backend could
+// satisfy the same contract without changing any of the 20 ledger tool
+// handlers in internal/tools/ledger, which depend on Store, not *DB.
 package ledger
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"fmt"
@@ -16,7 +21,67 @@ import (
 //go:embed schema.sql
 var schemaFS embed.FS
 
-// DB wraps a SQLite connection.
+// Store is the ledger persistence contract. Every tool handler in
+// internal/tools/ledger depends on this interface, never on *DB directly,
+// so an alternate backend is a new Factory + Store implementation away --
+// no handler changes required.
+type Store interface {
+	// Projects
+	GetOrCreateProject(ctx context.Context, key, name string) (*Project, error)
+	GetOrCreateProjectForWrite(ctx context.Context, key, name string) (*Project, error)
+	GetProjectByID(ctx context.Context, id string) (*Project, error)
+	ListProjects(ctx context.Context) ([]Project, error)
+
+	// Items
+	CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
+	GetItem(ctx context.Context, id string) (*Item, error)
+	ListItems(ctx context.Context, f ItemFilter) ([]Item, error)
+	UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error)
+	UpdateItemStatus(ctx context.Context, id, status string) (*Item, error)
+	UpdateItemPriority(ctx context.Context, id string, priority int) (*Item, error)
+	UpdateItemAssignee(ctx context.Context, id, assignee string) (*Item, error)
+
+	// Resources
+	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
+	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
+
+	// Notes
+	AddNote(ctx context.Context, p AddNoteParams) (*Note, error)
+	ListNotes(ctx context.Context, itemID, projectID string) ([]Note, error)
+	StartTimer(ctx context.Context, itemID string) (*Note, error)
+	StopTimer(ctx context.Context, itemID string) (*Note, error)
+
+	// Relations
+	RelateItems(ctx context.Context, fromID, toID, relationType string) (*ItemRelation, error)
+	ListRelations(ctx context.Context, itemID string) ([]ItemRelation, error)
+
+	// Cross-cutting
+	SummarizeProject(ctx context.Context, projectID, projectKey string) (*ProjectSummary, error)
+	ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, error)
+	SoftDelete(ctx context.Context, entityType, id string) error
+	Restore(ctx context.Context, entityType, id string) error
+
+	Close() error
+}
+
+// Factory constructs a Store. SQLiteFactory is the only implementation
+// today; a MySQLFactory or PostgresFactory would satisfy the same
+// interface later without changing anything that depends on Factory or
+// Store.
+type Factory interface {
+	Open() (Store, error)
+}
+
+// SQLiteFactory creates SQLite-backed Store instances at the location
+// Path() resolves (LEDGER_DB_PATH, else XDG_DATA_HOME).
+type SQLiteFactory struct{}
+
+// Open implements Factory.
+func (SQLiteFactory) Open() (Store, error) {
+	return open()
+}
+
+// DB wraps a SQLite connection. It implements Store.
 type DB struct {
 	conn *sql.DB
 }
@@ -39,9 +104,16 @@ func Path() (string, error) {
 	return filepath.Join(base, "mcp-local", "ledger.db"), nil
 }
 
-// Open resolves the database path, ensures its parent directory exists,
+// Open is a convenience wrapper around SQLiteFactory{}.Open() -- kept so the
+// 20 existing ledger tool handlers (each calling ledgerstore.Open()) need no
+// changes; only their inferred variable type changed, from *DB to Store.
+func Open() (Store, error) {
+	return SQLiteFactory{}.Open()
+}
+
+// open resolves the database path, ensures its parent directory exists,
 // opens the connection, locks down file permissions, and applies the schema.
-func Open() (*DB, error) {
+func open() (*DB, error) {
 	path, err := Path()
 	if err != nil {
 		return nil, err
