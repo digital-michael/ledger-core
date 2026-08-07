@@ -11,9 +11,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// Item is a unit of work: an epic, story, or task. Hierarchy is expressed
-// via ParentID (containment); cross-cutting edges that aren't containment
-// live in item_relations instead.
+// Item is a unit of work, typed for full lifecycle accounting from discovery
+// through deployment and support: epic, story, task, spike, plan, defect,
+// release, or incident. Hierarchy is expressed via ParentID (containment);
+// cross-cutting edges that aren't containment live in item_relations instead.
 type Item struct {
 	ID          string
 	ProjectID   string
@@ -44,6 +45,20 @@ type CreateItemParams struct {
 
 const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, created_at, updated_at`
 
+// validItemTypesDesc lists the allowed values for CreateItemParams.Type, for
+// use in the rejection error message.
+const validItemTypesDesc = "epic, story, task, spike, plan, defect, release, incident"
+
+// validItemTypes covers the full work lifecycle: discovery (spike),
+// planning (epic, story, plan), implementation (task), quality (defect),
+// deployment (release), and support (incident). Enforced only at creation --
+// Type has no update path through any tool, so this is the only place it
+// needs to be checked.
+var validItemTypes = map[string]bool{
+	"epic": true, "story": true, "task": true, "spike": true,
+	"plan": true, "defect": true, "release": true, "incident": true,
+}
+
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
@@ -59,6 +74,9 @@ func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error) {
 	if p.Type == "" {
 		p.Type = "task"
+	}
+	if !validItemTypes[p.Type] {
+		return nil, fmt.Errorf("invalid type %q: must be one of %s", p.Type, validItemTypesDesc)
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
