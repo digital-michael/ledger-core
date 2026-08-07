@@ -30,14 +30,16 @@ type Item struct {
 	UpdatedAt   string
 }
 
-// CreateItemParams are the inputs to CreateItem. Type defaults to "task" and
-// nesting is unconstrained — ParentID is never validated against Type.
+// CreateItemParams are the inputs to CreateItem. Type defaults to "task",
+// Status defaults to "backlog", and nesting is unconstrained — ParentID is
+// never validated against Type.
 type CreateItemParams struct {
 	ProjectID   string
 	ParentID    string
 	Type        string
 	Title       string
 	Description string
+	Status      string
 	Label       string
 	Priority    *int
 	Assignee    string
@@ -59,6 +61,19 @@ var validItemTypes = map[string]bool{
 	"plan": true, "defect": true, "release": true, "incident": true,
 }
 
+// validStatusesDesc lists the allowed values for CreateItemParams.Status and
+// UpdateItemStatus's status, for use in rejection error messages.
+const validStatusesDesc = "backlog, planned, in_progress, blocked, done"
+
+// validStatuses mirrors validItemTypes' shape. Creating an item already-done
+// (or already in_progress, etc.) is a real, common need -- e.g. logging past
+// work -- so Status is a real input to CreateItem, not always hardcoded, and
+// needs the same validation Type already has.
+var validStatuses = map[string]bool{
+	"backlog": true, "planned": true, "in_progress": true,
+	"blocked": true, "done": true,
+}
+
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
@@ -78,6 +93,12 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	if !validItemTypes[p.Type] {
 		return nil, fmt.Errorf("invalid type %q: must be one of %s", p.Type, validItemTypesDesc)
 	}
+	if p.Status == "" {
+		p.Status = "backlog"
+	}
+	if !validStatuses[p.Status] {
+		return nil, fmt.Errorf("invalid status %q: must be one of %s", p.Status, validStatusesDesc)
+	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -94,9 +115,9 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, assignee, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), now, now,
+		p.Status, nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -128,10 +149,13 @@ func (db *DB) GetItem(ctx context.Context, id string) (*Item, error) {
 }
 
 // ItemFilter narrows ListItems. Zero-value fields mean "no filter" on that
-// column; ProjectID is always required. ParentID and TopLevelOnly are
-// mutually exclusive in intent (a specific parent vs. "no parent at all");
-// if both are set, ParentID wins and TopLevelOnly is ignored — narrowing to
-// a specific parent is more specific than "top-level only".
+// column, INCLUDING ProjectID — leaving it empty means every project, not
+// "no results" (the tool layer is responsible for requiring a project
+// unless the caller explicitly asked for an all-projects query). ParentID
+// and TopLevelOnly are mutually exclusive in intent (a specific parent vs.
+// "no parent at all"); if both are set, ParentID wins and TopLevelOnly is
+// ignored — narrowing to a specific parent is more specific than "top-level
+// only".
 type ItemFilter struct {
 	ProjectID    string
 	Status       string
@@ -142,11 +166,16 @@ type ItemFilter struct {
 	Assignee     string
 }
 
-// ListItems returns items in a project matching the given filters, ordered
-// by creation time.
+// ListItems returns items matching the given filters, ordered by creation
+// time — across every project if f.ProjectID is empty, or scoped to one if
+// set.
 func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
-	q := `SELECT ` + itemColumns + ` FROM items WHERE project_id = ? AND deleted_at IS NULL`
-	args := []any{f.ProjectID}
+	q := `SELECT ` + itemColumns + ` FROM items WHERE deleted_at IS NULL`
+	var args []any
+	if f.ProjectID != "" {
+		q += ` AND project_id = ?`
+		args = append(args, f.ProjectID)
+	}
 	if f.Status != "" {
 		q += ` AND status = ?`
 		args = append(args, f.Status)
@@ -189,9 +218,44 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 	return items, rows.Err()
 }
 
+// FindItems does a substring, case-insensitive search over item titles.
+// projectID empty means every project -- there's no FTS or title index in
+// this schema (fine at this ledger's actual scale of dozens-to-low-hundreds
+// of items), so a LIKE scan is the only option and deliberately not backed
+// by a new dependency.
+func (db *DB) FindItems(ctx context.Context, projectID, query string) ([]Item, error) {
+	q := `SELECT ` + itemColumns + ` FROM items WHERE deleted_at IS NULL AND title LIKE ?`
+	args := []any{"%" + query + "%"}
+	if projectID != "" {
+		q += ` AND project_id = ?`
+		args = append(args, projectID)
+	}
+	q += ` ORDER BY created_at`
+
+	rows, err := db.conn.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []Item
+	for rows.Next() {
+		it, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *it)
+	}
+	return items, rows.Err()
+}
+
 // UpdateItemStatus changes an item's status and records the before/after
 // values in audit_log, in the same transaction as the update.
 func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, error) {
+	if !validStatuses[status] {
+		return nil, fmt.Errorf("invalid status %q: must be one of %s", status, validStatusesDesc)
+	}
+
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -222,6 +286,26 @@ func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, e
 	}
 
 	return db.GetItem(ctx, id)
+}
+
+// BulkStatusResult is one id's outcome from BulkUpdateItemStatus.
+type BulkStatusResult struct {
+	ID    string
+	Item  *Item
+	Error error
+}
+
+// BulkUpdateItemStatus applies UpdateItemStatus to each id independently --
+// one bad id doesn't block the rest. Each success gets its own real
+// audit_log entry, exactly as if updated individually; there is no
+// bulk-specific audit shape.
+func (db *DB) BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult {
+	results := make([]BulkStatusResult, 0, len(ids))
+	for _, id := range ids {
+		item, err := db.UpdateItemStatus(ctx, id, status)
+		results = append(results, BulkStatusResult{ID: id, Item: item, Error: err})
+	}
+	return results
 }
 
 // UpdateItemPriority changes an item's priority and records the before/after

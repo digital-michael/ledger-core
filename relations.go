@@ -52,6 +52,26 @@ func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string
 	return &ItemRelation{ID: id, FromItemID: fromID, ToItemID: toID, RelationType: relationType, CreatedAt: now}, nil
 }
 
+// BulkRelateResult is one from-id's outcome from BulkRelateItems.
+type BulkRelateResult struct {
+	FromID   string
+	Relation *ItemRelation
+	Error    error
+}
+
+// BulkRelateItems relates each of fromIDs to toID independently -- one bad id
+// (including one that doesn't exist, rejected by item_relations' foreign key
+// constraint) doesn't block the rest. Each success gets its own real
+// audit_log entry, exactly as if related individually via RelateItems.
+func (db *DB) BulkRelateItems(ctx context.Context, fromIDs []string, toID, relationType string) []BulkRelateResult {
+	results := make([]BulkRelateResult, 0, len(fromIDs))
+	for _, fromID := range fromIDs {
+		rel, err := db.RelateItems(ctx, fromID, toID, relationType)
+		results = append(results, BulkRelateResult{FromID: fromID, Relation: rel, Error: err})
+	}
+	return results
+}
+
 // ListRelations returns every relation touching itemID, in either direction
 // (it's the from side or the to side) — "what does this item depend on" and
 // "what depends on this item" are both real questions, so both directions
@@ -63,6 +83,36 @@ func (db *DB) ListRelations(ctx context.Context, itemID string) ([]ItemRelation,
 		 ORDER BY created_at`, itemID, itemID)
 	if err != nil {
 		return nil, fmt.Errorf("listing relations: %w", err)
+	}
+	defer rows.Close()
+
+	var relations []ItemRelation
+	for rows.Next() {
+		var r ItemRelation
+		if err := rows.Scan(&r.ID, &r.FromItemID, &r.ToItemID, &r.RelationType, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		relations = append(relations, r)
+	}
+	return relations, rows.Err()
+}
+
+// ListProjectRelations returns every relation where either side belongs to
+// projectID -- the whole cross-cutting dependency graph touching a project,
+// not just one item's neighbors. item_relations has no project_id column of
+// its own, and relations can cross projects (nothing prevents it), so this
+// joins to items on BOTH from_item_id and to_item_id, matching if either
+// side belongs to projectID.
+func (db *DB) ListProjectRelations(ctx context.Context, projectID string) ([]ItemRelation, error) {
+	rows, err := db.conn.QueryContext(ctx,
+		`SELECT r.id, r.from_item_id, r.to_item_id, r.relation_type, r.created_at
+		 FROM item_relations r
+		 JOIN items i_from ON r.from_item_id = i_from.id
+		 JOIN items i_to ON r.to_item_id = i_to.id
+		 WHERE (i_from.project_id = ? OR i_to.project_id = ?) AND r.deleted_at IS NULL
+		 ORDER BY r.created_at`, projectID, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("listing project relations: %w", err)
 	}
 	defer rows.Close()
 

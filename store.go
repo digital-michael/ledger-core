@@ -36,8 +36,10 @@ type Store interface {
 	CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	GetItem(ctx context.Context, id string) (*Item, error)
 	ListItems(ctx context.Context, f ItemFilter) ([]Item, error)
+	FindItems(ctx context.Context, projectID, query string) ([]Item, error)
 	UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error)
 	UpdateItemStatus(ctx context.Context, id, status string) (*Item, error)
+	BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult
 	UpdateItemPriority(ctx context.Context, id string, priority int) (*Item, error)
 	UpdateItemAssignee(ctx context.Context, id, assignee string) (*Item, error)
 
@@ -53,7 +55,9 @@ type Store interface {
 
 	// Relations
 	RelateItems(ctx context.Context, fromID, toID, relationType string) (*ItemRelation, error)
+	BulkRelateItems(ctx context.Context, fromIDs []string, toID, relationType string) []BulkRelateResult
 	ListRelations(ctx context.Context, itemID string) ([]ItemRelation, error)
+	ListProjectRelations(ctx context.Context, projectID string) ([]ItemRelation, error)
 
 	// Cross-cutting
 	SummarizeProject(ctx context.Context, projectID, projectKey string) (*ProjectSummary, error)
