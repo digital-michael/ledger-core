@@ -173,7 +173,22 @@ func open() (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	if err := ensureColumn(conn, "items", "component_id", "TEXT REFERENCES items(id)"); err != nil {
+	// component_id (a foreign key) was replaced by component (a plain
+	// denormalized string) before any external release existed to depend on
+	// the old shape -- see docs/ledger.md. A database that already ran the
+	// old migration has both the stale index and column; drop them (in that
+	// order -- SQLite won't drop a column an index still references) before
+	// adding the new one. Both drop steps are no-ops on a database that
+	// never had the old shape, including a brand-new one.
+	if _, err := conn.Exec(`DROP INDEX IF EXISTS idx_items_component`); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("dropping stale component index: %w", err)
+	}
+	if err := ensureColumnDropped(conn, "items", "component_id"); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if err := ensureColumn(conn, "items", "component", "TEXT"); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -181,9 +196,9 @@ func open() (*DB, error) {
 	// rather than in schema.sql -- schema.sql is applied wholesale before
 	// these ensureColumn migrations run, so an index on a migrated-in column
 	// would fail with "no such column" on any database that predates it.
-	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component_id)`); err != nil {
+	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component)`); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("creating component_id index: %w", err)
+		return nil, fmt.Errorf("creating component index: %w", err)
 	}
 
 	return &DB{conn: conn}, nil
@@ -218,6 +233,44 @@ func ensureColumn(conn *sql.DB, table, column, columnType string) error {
 
 	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType)); err != nil {
 		return fmt.Errorf("adding column %s.%s: %w", table, column, err)
+	}
+	return nil
+}
+
+// ensureColumnDropped is ensureColumn's inverse: removes column from table if
+// present. Needed when a migrated-in column's shape itself changes later
+// (component_id, a foreign key, replaced by component, a plain
+// denormalized string) -- SQLite's ALTER TABLE DROP COLUMN has no "IF
+// EXISTS" form either, so this checks PRAGMA table_info first, same as
+// ensureColumn.
+func ensureColumnDropped(conn *sql.DB, table, column string) error {
+	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return fmt.Errorf("inspecting %s schema: %w", table, err)
+	}
+	defer rows.Close()
+
+	found := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+
+	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", table, column)); err != nil {
+		return fmt.Errorf("dropping column %s.%s: %w", table, column, err)
 	}
 	return nil
 }

@@ -15,13 +15,16 @@ import (
 // through deployment and support: epic, story, task, spike, plan, defect,
 // release, incident, or component. Hierarchy is expressed via ParentID
 // (containment); cross-cutting edges that aren't containment live in
-// item_relations instead. ComponentID is a third, orthogonal axis: which
-// part of the system this item touches (a specification-level marker,
-// zero-or-one, distinct from both containment and the free-form Label) --
-// it may point at a component belonging to a different project entirely,
-// matching item_relations' existing tolerance for crossing project
-// boundaries (every project lives in one shared collection, not siloed
-// databases).
+// item_relations instead. Component is a third, orthogonal axis: which part
+// of the system this item touches (a specification-level marker, zero-or-
+// one, distinct from both containment and the free-form Label). It is a
+// plain denormalized string copied from an existing type=component item's
+// title at assignment time -- not a foreign key -- deliberately, since
+// project reorganization (merging/splitting projects, eventual cross-
+// instance sync) is expected work, and a string needs no reference
+// reconciliation when data moves; a stored id would. The tradeoff, accepted:
+// renaming a component's pool entry does not retroactively update items that
+// already copied its old title.
 type Item struct {
 	ID          string
 	ProjectID   string
@@ -33,16 +36,16 @@ type Item struct {
 	Label       sql.NullString
 	Priority    sql.NullInt64
 	Assignee    sql.NullString
-	ComponentID sql.NullString
+	Component   sql.NullString
 	CreatedAt   string
 	UpdatedAt   string
 }
 
 // CreateItemParams are the inputs to CreateItem. Type defaults to "task",
 // Status defaults to "backlog", and nesting is unconstrained — ParentID is
-// never validated against Type. ComponentID, if given, must reference an
-// existing type=component item (any project) — validated the same way
-// Type/Status are, not left to a database constraint alone.
+// never validated against Type. Component, if given, must exactly match an
+// existing type=component item's title (any project) at write time --
+// validated then copied as a plain string, not kept as a live reference.
 type CreateItemParams struct {
 	ProjectID   string
 	ParentID    string
@@ -53,10 +56,10 @@ type CreateItemParams struct {
 	Label       string
 	Priority    *int
 	Assignee    string
-	ComponentID string
+	Component   string
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component_id, created_at, updated_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at`
 
 // validItemTypesDesc lists the allowed values for CreateItemParams.Type, for
 // use in the rejection error message.
@@ -74,22 +77,27 @@ var validItemTypes = map[string]bool{
 	"component": true,
 }
 
-// validateComponentID confirms componentID refers to a real, existing
-// type=component item. No project check -- component assignment is
-// deliberately cross-project-tolerant, matching item_relations. No
-// deleted_at check either, matching RelateItems' existing precedent (a
-// foreign key only cares that the row exists, not its soft-delete state).
-func validateComponentID(ctx context.Context, tx *sql.Tx, componentID string) error {
-	var typ string
-	err := tx.QueryRowContext(ctx, `SELECT type FROM items WHERE id = ?`, componentID).Scan(&typ)
-	if err == sql.ErrNoRows {
-		return fmt.Errorf("component_id %q not found", componentID)
-	}
+// validateComponentTitle confirms title exactly matches some existing,
+// non-deleted type=component item, in any project -- component assignment
+// is deliberately cross-project-tolerant, matching item_relations. Unlike
+// the earlier id-based version this replaced, there is no ambiguity to
+// resolve here: Component is a plain copied string, not a reference to one
+// specific row, so it doesn't matter WHICH project's pool entry the title
+// came from, only that it's a real, currently-live component name
+// somewhere. deleted_at IS checked here (unlike RelateItems' precedent for
+// live references) because this is a one-time snapshot copy, not a
+// persistent pointer -- copying a retired component's name is more likely a
+// mistake than a deliberate reference to preserve.
+func validateComponentTitle(ctx context.Context, tx *sql.Tx, title string) error {
+	var count int
+	err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM items WHERE type = 'component' AND title = ? AND deleted_at IS NULL`, title,
+	).Scan(&count)
 	if err != nil {
-		return fmt.Errorf("looking up component_id %q: %w", componentID, err)
+		return fmt.Errorf("checking component %q: %w", title, err)
 	}
-	if typ != "component" {
-		return fmt.Errorf("component_id %q is not a component (type=%q)", componentID, typ)
+	if count == 0 {
+		return fmt.Errorf("no component titled %q exists in any project's pool", title)
 	}
 	return nil
 }
@@ -97,9 +105,10 @@ func validateComponentID(ctx context.Context, tx *sql.Tx, componentID string) er
 // validateComponentTitleUnique rejects creating/renaming a type=component
 // item into a title that collides with another (non-deleted) component
 // already in the same project. Components are a curated, named pool --
-// unlike ordinary items, whose titles are never constrained -- and
-// component_title lookup (internal/tools/ledger) depends on this to stay
-// unambiguous within a project. excludeID is the item being
+// unlike ordinary items, whose titles are never constrained -- and matters
+// even without an id-based reference: a project whose own pool has two
+// entries both titled "Auth" is just as confusing to a human picking a
+// value as it would be to a lookup-by-id. excludeID is the item being
 // updated/excluded from its own collision check; pass "" when creating (no
 // real item has an empty id, so the exclusion is a harmless no-op there).
 func validateComponentTitleUnique(ctx context.Context, tx *sql.Tx, projectID, title, excludeID string) error {
@@ -133,7 +142,7 @@ var validStatuses = map[string]bool{
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.ComponentID, &it.CreatedAt, &it.UpdatedAt)
+		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -162,8 +171,8 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 	defer tx.Rollback()
 
-	if p.ComponentID != "" {
-		if err := validateComponentID(ctx, tx, p.ComponentID); err != nil {
+	if p.Component != "" {
+		if err := validateComponentTitle(ctx, tx, p.Component); err != nil {
 			return nil, err
 		}
 	}
@@ -181,10 +190,10 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, assignee, component_id, created_at, updated_at)
+		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		p.Status, nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.ComponentID), now, now,
+		p.Status, nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -231,7 +240,7 @@ type ItemFilter struct {
 	ParentID     string
 	TopLevelOnly bool
 	Assignee     string
-	ComponentID  string
+	Component    string
 }
 
 // ListItems returns items matching the given filters, ordered by creation
@@ -260,9 +269,9 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 		q += ` AND assignee = ?`
 		args = append(args, f.Assignee)
 	}
-	if f.ComponentID != "" {
-		q += ` AND component_id = ?`
-		args = append(args, f.ComponentID)
+	if f.Component != "" {
+		q += ` AND component = ?`
+		args = append(args, f.Component)
 	}
 	switch {
 	case f.ParentID != "":
@@ -421,26 +430,26 @@ func (db *DB) UpdateItemPriority(ctx context.Context, id string, priority int) (
 
 // UpdateItemParams is UpdateItem's per-field patch: nil means "leave this
 // field unchanged." At least one field must be set. Description/Label/
-// ComponentID use *string so an explicit empty string still clears them
+// Component use *string so an explicit empty string still clears them
 // (nullIfEmpty, same convention as every other free-text field) — nil is
-// genuinely different from "set to empty." A non-empty ComponentID is
-// validated the same way CreateItem validates it (must exist, must be
-// type=component, no project check).
+// genuinely different from "set to empty." A non-empty Component is
+// validated the same way CreateItem validates it (must exactly match some
+// existing type=component item's title, any project).
 type UpdateItemParams struct {
 	Title       *string
 	Description *string
 	Label       *string
-	ComponentID *string
+	Component   *string
 }
 
-// UpdateItem patches an item's title/description/label/component_id —
+// UpdateItem patches an item's title/description/label/component —
 // whichever fields are non-nil in p — and records exactly what changed
 // (old/new per field) in a single "updated" audit_log entry. A field whose
 // new value equals its current value is not recorded as a change and does
 // not appear in the UPDATE at all.
 func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error) {
-	if p.Title == nil && p.Description == nil && p.Label == nil && p.ComponentID == nil {
-		return nil, errors.New("at least one of title, description, label, or component_id must be given")
+	if p.Title == nil && p.Description == nil && p.Label == nil && p.Component == nil {
+		return nil, errors.New("at least one of title, description, label, or component must be given")
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
@@ -450,9 +459,9 @@ func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*I
 	defer tx.Rollback()
 
 	var projectID, itemType, oldTitle string
-	var oldDescription, oldLabel, oldComponentID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component_id FROM items WHERE id = ?`, id).
-		Scan(&projectID, &itemType, &oldTitle, &oldDescription, &oldLabel, &oldComponentID)
+	var oldDescription, oldLabel, oldComponent sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component FROM items WHERE id = ?`, id).
+		Scan(&projectID, &itemType, &oldTitle, &oldDescription, &oldLabel, &oldComponent)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)
 	}
@@ -484,15 +493,15 @@ func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*I
 		setClauses = append(setClauses, "label = ?")
 		args = append(args, nullIfEmpty(*p.Label))
 	}
-	if p.ComponentID != nil && *p.ComponentID != oldComponentID.String {
-		if *p.ComponentID != "" {
-			if err := validateComponentID(ctx, tx, *p.ComponentID); err != nil {
+	if p.Component != nil && *p.Component != oldComponent.String {
+		if *p.Component != "" {
+			if err := validateComponentTitle(ctx, tx, *p.Component); err != nil {
 				return nil, err
 			}
 		}
-		changes["component_id"] = [2]string{oldComponentID.String, *p.ComponentID}
-		setClauses = append(setClauses, "component_id = ?")
-		args = append(args, nullIfEmpty(*p.ComponentID))
+		changes["component"] = [2]string{oldComponent.String, *p.Component}
+		setClauses = append(setClauses, "component = ?")
+		args = append(args, nullIfEmpty(*p.Component))
 	}
 
 	if len(setClauses) == 0 {
