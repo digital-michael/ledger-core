@@ -173,6 +173,18 @@ func open() (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	if err := ensureColumn(conn, "items", "component_id", "TEXT REFERENCES items(id)"); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	// Created here, after the migration above guarantees the column exists,
+	// rather than in schema.sql -- schema.sql is applied wholesale before
+	// these ensureColumn migrations run, so an index on a migrated-in column
+	// would fail with "no such column" on any database that predates it.
+	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component_id)`); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("creating component_id index: %w", err)
+	}
 
 	return &DB{conn: conn}, nil
 }

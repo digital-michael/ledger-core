@@ -18,20 +18,21 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE TABLE IF NOT EXISTS items (
-  id          TEXT PRIMARY KEY,
-  project_id  TEXT NOT NULL REFERENCES projects(id),
-  parent_id   TEXT REFERENCES items(id),
-  type        TEXT NOT NULL DEFAULT 'task',
-  title       TEXT NOT NULL,
-  description TEXT,
-  status      TEXT NOT NULL,
-  label       TEXT,
-  priority    INTEGER,
-  order_key   INTEGER,
-  assignee    TEXT,
-  created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL,
-  deleted_at  TEXT
+  id           TEXT PRIMARY KEY,
+  project_id   TEXT NOT NULL REFERENCES projects(id),
+  parent_id    TEXT REFERENCES items(id),
+  type         TEXT NOT NULL DEFAULT 'task',
+  title        TEXT NOT NULL,
+  description  TEXT,
+  status       TEXT NOT NULL,
+  label        TEXT,
+  priority     INTEGER,
+  order_key    INTEGER,
+  assignee     TEXT,
+  component_id TEXT REFERENCES items(id),
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  deleted_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS resources (
@@ -83,6 +84,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_items_project ON items(project_id);
 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
+-- idx_items_component intentionally NOT here: on a pre-existing database
+-- this whole file is applied (CREATE TABLE IF NOT EXISTS is a no-op, but
+-- CREATE INDEX still runs) BEFORE store.go's ensureColumn() migration adds
+-- component_id, so an index on that column here would fail with "no such
+-- column" on any database that predates it. Created in store.go's open(),
+-- after the migration, instead.
 CREATE INDEX IF NOT EXISTS idx_resources_project ON resources(project_id);
 CREATE INDEX IF NOT EXISTS idx_resources_item ON resources(item_id);
 CREATE INDEX IF NOT EXISTS idx_notes_item ON notes(item_id);
