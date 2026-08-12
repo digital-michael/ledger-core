@@ -211,9 +211,67 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	return db.GetItem(ctx, id)
 }
 
-// GetItem fetches a single item by id.
+// resolveItemID resolves id to an exact item id: an exact match first, then
+// a unique-prefix match if no exact match exists -- mirrors git's short-hash
+// resolution, since ids are commonly truncated in conversation/doc
+// references (e.g. "ticket 37f26083") but ledger_get_item historically
+// required the full UUID. Errors clearly, listing every candidate, if the
+// prefix matches more than one item rather than silently picking one.
+// Deliberately does not filter deleted_at -- matches GetItem's own existing
+// behavior of being able to fetch a soft-deleted item (e.g. to inspect it
+// before ledger_restore).
+func (db *DB) resolveItemID(ctx context.Context, id string) (string, error) {
+	var exact string
+	err := db.conn.QueryRowContext(ctx, `SELECT id FROM items WHERE id = ?`, id).Scan(&exact)
+	if err == nil {
+		return exact, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", err
+	}
+
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, title FROM items WHERE id LIKE ? || '%'`, id)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	type candidate struct{ id, title string }
+	var matches []candidate
+	for rows.Next() {
+		var c candidate
+		if err := rows.Scan(&c.id, &c.title); err != nil {
+			return "", err
+		}
+		matches = append(matches, c)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("item %q not found", id)
+	case 1:
+		return matches[0].id, nil
+	default:
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "id %q matches more than one item, be more specific:\n", id)
+		for _, m := range matches {
+			fmt.Fprintf(&sb, "  %s %q\n", m.id, m.title)
+		}
+		return "", errors.New(strings.TrimRight(sb.String(), "\n"))
+	}
+}
+
+// GetItem fetches a single item by id -- either an exact id or a unique
+// prefix of one (see resolveItemID).
 func (db *DB) GetItem(ctx context.Context, id string) (*Item, error) {
-	row := db.conn.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, id)
+	resolvedID, err := db.resolveItemID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	row := db.conn.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, resolvedID)
 	it, err := scanItem(row)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)

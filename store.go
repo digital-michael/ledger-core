@@ -37,6 +37,7 @@ type Store interface {
 	GetItem(ctx context.Context, id string) (*Item, error)
 	ListItems(ctx context.Context, f ItemFilter) ([]Item, error)
 	FindItems(ctx context.Context, projectID, query string) ([]Item, error)
+	SearchItems(ctx context.Context, projectID, query string) ([]SearchResult, error)
 	UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error)
 	UpdateItemStatus(ctx context.Context, id, status string) (*Item, error)
 	BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult
