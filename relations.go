@@ -20,10 +20,36 @@ type ItemRelation struct {
 	CreatedAt    string
 }
 
-// RelateItems inserts a relation between two items. relationType is one of
-// blocked_by, depends_on, related_to — not validated against that set here;
-// the tool layer is where user-facing validation belongs.
+// validRelationTypesDesc lists the allowed values for RelateItems' and
+// BulkRelateItems' relationType, for use in rejection error messages.
+const validRelationTypesDesc = "blocked_by, depends_on, related_to, part_of"
+
+// validRelationTypes mirrors validStatuses'/validItemTypes' shape in items.go.
+//
+// This validation used to live only in the tool layer's mcp.Enum, on the
+// stated reasoning that "the tool layer is where user-facing validation
+// belongs". That turned out not to hold: mcp.Enum populates the advertised
+// JSON schema but does not reject at runtime, so four rows outside this set
+// reached the database -- blocks (x2), follows_up_on, and serves -- two of
+// them written 10 and 11 days AFTER the enum shipped. A declared vocabulary
+// nothing enforces is documentation, not a constraint.
+//
+// The store is the right home for it because it is the one layer every
+// writer passes through; the tool layer is only one of several front doors
+// (see also the planned ledger-server HTTP API, epic d28ed3b2). The tool
+// layer keeps its enum for discoverability -- it is what tells a caller the
+// vocabulary exists -- but is no longer the thing relied on to enforce it.
+var validRelationTypes = map[string]bool{
+	"blocked_by": true, "depends_on": true, "related_to": true, "part_of": true,
+}
+
+// RelateItems inserts a relation between two items, rejecting any
+// relationType outside validRelationTypes.
 func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string) (*ItemRelation, error) {
+	if !validRelationTypes[relationType] {
+		return nil, fmt.Errorf("invalid relation_type %q: must be one of %s", relationType, validRelationTypesDesc)
+	}
+
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err

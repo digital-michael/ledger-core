@@ -12,8 +12,10 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -127,7 +129,44 @@ func open() (*DB, error) {
 		return nil, fmt.Errorf("creating db directory: %w", err)
 	}
 
-	conn, err := sql.Open("sqlite", path)
+	// Pragmas go in the DSN, not in a conn.Exec() after opening, for two
+	// separate reasons -- both of which were found by measurement on
+	// 2026-09-07, after an initial fix that used conn.Exec() failed exactly
+	// the concurrency test it was written to pass:
+	//
+	//  1. TOO LATE. Ping() below is what actually establishes the first
+	//     connection, and under contention Ping() itself returns SQLITE_BUSY
+	//     -- before any Exec() could have set a busy timeout. In a 5-process
+	//     test, 3 of 100 real ledger_create_item calls failed at
+	//     "connecting to db" with the Exec()-based fix in place.
+	//  2. WRONG SCOPE. A pragma is per-connection, but database/sql keeps a
+	//     POOL. conn.Exec() applies to whichever pooled connection happens to
+	//     serve that one call; every connection the pool opens later reverts
+	//     to the defaults. DSN pragmas are applied by the driver to every
+	//     connection it creates, which is the only correct scope for these.
+	//     (This is a pre-existing bug in the foreign_keys pragma, which was
+	//     set by Exec() here and therefore was never reliably on for more
+	//     than one pooled connection. Moving it into the DSN fixes that too.)
+	//
+	// busy_timeout: SQLite allows one writer at a time and, at the default of
+	// 0, a second writer gives up instantly rather than waiting its turn.
+	// Measured with 5 concurrent processes x 200 transactional writes: 77 of
+	// 1000 succeeded without it, 1000 of 1000 with it.
+	//
+	// journal_mode=WAL: lets readers proceed while a writer holds the lock,
+	// ~4x faster under this database's real concurrency (one mcp-local per
+	// Claude Code session, plus mcp-console). It is persisted in the file, so
+	// it converts once and is a no-op on every subsequent open. It must be
+	// applied after busy_timeout, since converting journal mode needs an
+	// exclusive lock and is therefore the statement most likely to be blocked
+	// -- the driver guarantees that ordering by pushing busy_timeout to the
+	// front of the _pragma list regardless of the order given here.
+	dsn := "file:" + url.PathEscape(path) +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=foreign_keys(ON)"
+
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening db: %w", err)
 	}
@@ -143,9 +182,18 @@ func open() (*DB, error) {
 		return nil, fmt.Errorf("setting db file permissions: %w", err)
 	}
 
-	if _, err := conn.Exec(`PRAGMA foreign_keys = ON;`); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("enabling foreign keys: %w", err)
+	// Verify the mode actually in effect rather than assuming the DSN pragma
+	// took: `PRAGMA journal_mode` reports the current mode, and a conversion
+	// that loses the exclusive-lock race reports the OLD value instead of
+	// erroring -- so a silent no-op and a success are indistinguishable
+	// without reading it back. Not fatal either way: losing the race to a
+	// peer process that already converted the file is harmless, and a working
+	// delete-mode connection beats refusing to open at all. Warn and continue.
+	var journalMode string
+	if err := conn.QueryRow(`PRAGMA journal_mode;`).Scan(&journalMode); err != nil {
+		fmt.Fprintf(os.Stderr, "ledger: could not read journal_mode (%v)\n", err)
+	} else if !strings.EqualFold(journalMode, "wal") {
+		fmt.Fprintf(os.Stderr, "ledger: journal_mode is %q, not WAL; concurrent writes will be slower\n", journalMode)
 	}
 
 	schema, err := schemaFS.ReadFile("schema.sql")
