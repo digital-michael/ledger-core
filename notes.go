@@ -267,7 +267,7 @@ func (db *DB) UpdateNote(ctx context.Context, id string, p UpdateNoteParams) (*N
 		return nil, fmt.Errorf("note %q is a %s timer event, which is history and cannot be edited; only comments can be", id, noteType)
 	}
 	if deletedAt.Valid {
-		return nil, fmt.Errorf("note %q is deleted; restore it first (ledger_restore entity_type=note id=%s)", id, id)
+		return nil, errDeleted("note", id)
 	}
 
 	changes := map[string][2]string{}

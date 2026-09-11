@@ -373,12 +373,16 @@ func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, e
 	defer tx.Rollback()
 
 	var oldStatus string
-	err = tx.QueryRowContext(ctx, `SELECT status FROM items WHERE id = ?`, id).Scan(&oldStatus)
+	var deletedAt sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT status, deleted_at FROM items WHERE id = ?`, id).Scan(&oldStatus, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+	if deletedAt.Valid {
+		return nil, errDeleted("item", id)
 	}
 
 	now := nowUTC()
@@ -428,12 +432,16 @@ func (db *DB) UpdateItemPriority(ctx context.Context, id string, priority int) (
 	defer tx.Rollback()
 
 	var oldPriority sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT priority FROM items WHERE id = ?`, id).Scan(&oldPriority)
+	var deletedAt sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT priority, deleted_at FROM items WHERE id = ?`, id).Scan(&oldPriority, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+	if deletedAt.Valid {
+		return nil, errDeleted("item", id)
 	}
 
 	now := nowUTC()
@@ -488,14 +496,17 @@ func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*I
 	defer tx.Rollback()
 
 	var projectID, itemType, oldTitle string
-	var oldDescription, oldLabel, oldComponent sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component FROM items WHERE id = ?`, id).
-		Scan(&projectID, &itemType, &oldTitle, &oldDescription, &oldLabel, &oldComponent)
+	var oldDescription, oldLabel, oldComponent, deletedAt sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component, deleted_at FROM items WHERE id = ?`, id).
+		Scan(&projectID, &itemType, &oldTitle, &oldDescription, &oldLabel, &oldComponent, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+	if deletedAt.Valid {
+		return nil, errDeleted("item", id)
 	}
 
 	changes := map[string][2]string{}
@@ -569,12 +580,16 @@ func (db *DB) UpdateItemAssignee(ctx context.Context, id, assignee string) (*Ite
 	defer tx.Rollback()
 
 	var oldAssignee sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT assignee FROM items WHERE id = ?`, id).Scan(&oldAssignee)
+	var deletedAt sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT assignee, deleted_at FROM items WHERE id = ?`, id).Scan(&oldAssignee, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("item %q not found", id)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("looking up item %q: %w", id, err)
+	}
+	if deletedAt.Valid {
+		return nil, errDeleted("item", id)
 	}
 
 	now := nowUTC()

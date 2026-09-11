@@ -139,7 +139,7 @@ func (db *DB) UpdateResource(ctx context.Context, id string, p UpdateResourcePar
 		return nil, fmt.Errorf("looking up resource %q: %w", id, err)
 	}
 	if deletedAt.Valid {
-		return nil, fmt.Errorf("resource %q is deleted; restore it first (ledger_restore entity_type=resource id=%s)", id, id)
+		return nil, errDeleted("resource", id)
 	}
 
 	changes := map[string][2]string{}

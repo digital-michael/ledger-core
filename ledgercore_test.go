@@ -716,3 +716,53 @@ func runWriter() int {
 	}
 	return 0
 }
+
+// ---------------------------------------------------------------------------
+// Soft-deleted entities are read-only until restored
+// ---------------------------------------------------------------------------
+
+// Decided 2026-09-10 (defect b1c028d7): a soft-deleted item accepts no
+// changes except Restore. Before this, a deleted item -- hidden from every
+// list -- still took status, priority, assignee and field edits.
+func TestDeletedItemIsReadOnlyUntilRestored(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "iota")
+	it := mustItem(t, db, p.ID, "to be deleted")
+	if err := db.SoftDelete(ctx, "item", it.ID); err != nil {
+		t.Fatal(err)
+	}
+	auditBefore := len(auditRows(t, db, "item", it.ID))
+
+	const want = "is deleted; restore it first (ledger_restore entity_type=item"
+	_, err := db.UpdateItem(ctx, it.ID, UpdateItemParams{Title: ptr("edited while deleted")})
+	wantErrContaining(t, err, want)
+	_, err = db.UpdateItemStatus(ctx, it.ID, "done")
+	wantErrContaining(t, err, want)
+	_, err = db.UpdateItemPriority(ctx, it.ID, 9)
+	wantErrContaining(t, err, want)
+	_, err = db.UpdateItemAssignee(ctx, it.ID, "someone")
+	wantErrContaining(t, err, want)
+	bulk := db.BulkUpdateItemStatus(ctx, []string{it.ID}, "done")
+	if len(bulk) != 1 || bulk[0].Error == nil || !strings.Contains(bulk[0].Error.Error(), want) {
+		t.Errorf("BulkUpdateItemStatus on a deleted item: %+v", bulk)
+	}
+
+	// Nothing changed, and nothing was audited as if it had.
+	var title, status string
+	var priority, assignee sql.NullString
+	db.conn.QueryRow(`SELECT title, status, priority, assignee FROM items WHERE id = ?`, it.ID).Scan(&title, &status, &priority, &assignee)
+	if title != "to be deleted" || status != "backlog" || priority.Valid || assignee.Valid {
+		t.Errorf("deleted item was modified: title=%q status=%q priority=%v assignee=%v", title, status, priority, assignee)
+	}
+	if n := len(auditRows(t, db, "item", it.ID)); n != auditBefore {
+		t.Errorf("refused edits wrote %d audit row(s)", n-auditBefore)
+	}
+
+	// Restore is the one permitted change, and it makes the item editable again.
+	if err := db.Restore(ctx, "item", it.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpdateItemStatus(ctx, it.ID, "done"); err != nil {
+		t.Errorf("restored item still refused edits: %v", err)
+	}
+}
