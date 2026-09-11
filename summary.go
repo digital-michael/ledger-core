@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import "context"
 

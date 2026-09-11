@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/mark3labs/mcp-go/server"
 )
 
 // AuditEntry is one row of the audit_log — a record of a mutation or sync
@@ -26,17 +25,17 @@ type AuditEntry struct {
 // function in this package calls this inside its own transaction, so the
 // audit row and the change it describes commit or roll back together.
 //
-// client is derived from ctx, not a parameter — mcp-go's server stashes the
-// connected session in the request context all the way down into the tool
-// handler that eventually calls this, so clientFromContext reads it here,
-// once, rather than threading a "who called this" string through every
-// mutating function's signature.
-func insertAudit(ctx context.Context, tx *sql.Tx, entityType, entityID, operation, detail string) error {
+// client comes from Options.Client, resolved against ctx here, once, rather
+// than threading a "who called this" string through every mutating
+// function's signature. This package used to read it straight out of an
+// mcp-go session in ctx, which tied the storage layer to one caller's
+// transport; the caller now supplies the resolver (see Options.Client).
+func (db *DB) insertAudit(ctx context.Context, tx *sql.Tx, entityType, entityID, operation, detail string) error {
 	_, err := tx.ExecContext(ctx,
 		`INSERT INTO audit_log (id, entity_type, entity_id, operation, detail, created_at, client)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		uuid.NewString(), entityType, nullIfEmpty(entityID), operation, nullIfEmpty(detail), nowUTC(),
-		nullIfEmpty(clientFromContext(ctx)),
+		nullIfEmpty(db.clientName(ctx)),
 	)
 	return err
 }
@@ -50,20 +49,13 @@ func startOfTodayUTC() string {
 	return start.Format(time.RFC3339Nano)
 }
 
-// clientFromContext returns the negotiated MCP ClientInfo.Name of whatever
-// connection is making this call (e.g. "mcp-console/run"), or "" if there's
-// no session at all — which is the case for mcp-local's own in-process -run,
-// which bypasses the real protocol/session entirely.
-func clientFromContext(ctx context.Context) string {
-	session := server.ClientSessionFromContext(ctx)
-	if session == nil {
+// clientName returns whoever the caller says is performing this mutation,
+// or "" (stored as NULL) if the caller supplied no resolver.
+func (db *DB) clientName(ctx context.Context) string {
+	if db.client == nil {
 		return ""
 	}
-	sessionWithInfo, ok := session.(server.SessionWithClientInfo)
-	if !ok {
-		return ""
-	}
-	return sessionWithInfo.GetClientInfo().Name
+	return db.client(ctx)
 }
 
 // AuditFilter narrows ListAuditLog. Zero-value fields mean "no filter" on

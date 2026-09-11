@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import (
 	"context"
@@ -18,29 +18,6 @@ type ItemRelation struct {
 	ToItemID     string
 	RelationType string
 	CreatedAt    string
-}
-
-// validRelationTypesDesc lists the allowed values for RelateItems' and
-// BulkRelateItems' relationType, for use in rejection error messages.
-const validRelationTypesDesc = "blocked_by, depends_on, related_to, part_of"
-
-// validRelationTypes mirrors validStatuses'/validItemTypes' shape in items.go.
-//
-// This validation used to live only in the tool layer's mcp.Enum, on the
-// stated reasoning that "the tool layer is where user-facing validation
-// belongs". That turned out not to hold: mcp.Enum populates the advertised
-// JSON schema but does not reject at runtime, so four rows outside this set
-// reached the database -- blocks (x2), follows_up_on, and serves -- two of
-// them written 10 and 11 days AFTER the enum shipped. A declared vocabulary
-// nothing enforces is documentation, not a constraint.
-//
-// The store is the right home for it because it is the one layer every
-// writer passes through; the tool layer is only one of several front doors
-// (see also the planned ledger-server HTTP API, epic d28ed3b2). The tool
-// layer keeps its enum for discoverability -- it is what tells a caller the
-// vocabulary exists -- but is no longer the thing relied on to enforce it.
-var validRelationTypes = map[string]bool{
-	"blocked_by": true, "depends_on": true, "related_to": true, "part_of": true,
 }
 
 // RelateItems inserts a relation between two items, rejecting any
@@ -67,7 +44,7 @@ func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string
 	}
 
 	detail, _ := json.Marshal(map[string]string{"from_item_id": fromID, "to_item_id": toID, "relation_type": relationType})
-	if err := insertAudit(ctx, tx, "item_relation", id, "created", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item_relation", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 

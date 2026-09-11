@@ -1,0 +1,718 @@
+package ledgercore
+
+// Integration tests: every test opens a real SQLite ledger in a temp
+// directory through the public Open(), exactly as mcp-local and ledger-server
+// do. Tests that need to bypass this package (to prove the storage-level
+// triggers hold on their own) use db.conn directly, which is only possible
+// because these tests live inside the package.
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+
+	_ "modernc.org/sqlite"
+)
+
+const testClient = "ledgercore-test"
+
+var ctx = context.Background()
+
+// TestMain doubles as the entry point for the child writer processes used by
+// TestConcurrentWritersAcrossProcesses: the test binary re-executes itself
+// with LEDGERCORE_WRITER set, and in that mode runs runWriter instead of the
+// test suite.
+func TestMain(m *testing.M) {
+	if os.Getenv("LEDGERCORE_WRITER") != "" {
+		os.Exit(runWriter())
+	}
+	os.Exit(m.Run())
+}
+
+func ptr(s string) *string { return &s }
+
+func openAt(t *testing.T, path string) *DB {
+	t.Helper()
+	s, err := Open(Options{Path: path, Client: func(context.Context) string { return testClient }})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s.(*DB)
+}
+
+func openTest(t *testing.T) *DB {
+	t.Helper()
+	return openAt(t, filepath.Join(t.TempDir(), "ledger.db"))
+}
+
+func mustProject(t *testing.T, db *DB, key string) *Project {
+	t.Helper()
+	p, err := db.GetOrCreateProjectForWrite(ctx, key, key)
+	if err != nil {
+		t.Fatalf("GetOrCreateProjectForWrite: %v", err)
+	}
+	return p
+}
+
+func mustItem(t *testing.T, db *DB, projectID, title string) *Item {
+	t.Helper()
+	it, err := db.CreateItem(ctx, CreateItemParams{ProjectID: projectID, Title: title})
+	if err != nil {
+		t.Fatalf("CreateItem %q: %v", title, err)
+	}
+	return it
+}
+
+// auditRows returns every audit row for one entity, oldest first.
+func auditRows(t *testing.T, db *DB, entityType, id string) []AuditEntry {
+	t.Helper()
+	rows, err := db.conn.Query(`SELECT id, entity_type, entity_id, operation, detail, created_at, client
+		FROM audit_log WHERE entity_type = ? AND entity_id = ? ORDER BY rowid`, entityType, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var e AuditEntry
+		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Operation, &e.Detail, &e.CreatedAt, &e.Client); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func wantErrContaining(t *testing.T, err error, substr string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected an error containing %q, got nil", substr)
+	}
+	if !strings.Contains(err.Error(), substr) {
+		t.Fatalf("expected an error containing %q, got: %v", substr, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Opening the database
+// ---------------------------------------------------------------------------
+
+// The ledger's location must never move: every program opening it has to
+// resolve the same file, or a new build silently starts on an empty database.
+func TestDefaultPathResolution(t *testing.T) {
+	t.Setenv("LEDGER_DB_PATH", "/explicit/ledger.db")
+	if p, _ := DefaultPath(); p != "/explicit/ledger.db" {
+		t.Errorf("LEDGER_DB_PATH: got %q", p)
+	}
+
+	t.Setenv("LEDGER_DB_PATH", "")
+	t.Setenv("XDG_DATA_HOME", "/xdg")
+	if p, _ := DefaultPath(); p != "/xdg/mcp-local/ledger.db" {
+		t.Errorf("XDG_DATA_HOME: got %q", p)
+	}
+
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("HOME", "/home/someone")
+	if p, _ := DefaultPath(); p != "/home/someone/.local/share/mcp-local/ledger.db" {
+		t.Errorf("home fallback: got %q", p)
+	}
+}
+
+// Pragmas are per connection and database/sql keeps a pool, so they must be
+// applied to every pooled connection, not just whichever one served a single
+// Exec. Holding three connections at once forces three distinct ones.
+func TestOpenConfiguresEveryPooledConnection(t *testing.T) {
+	db := openTest(t)
+	var conns []*sql.Conn
+	for i := 0; i < 3; i++ {
+		c, err := db.conn.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	for i, c := range conns {
+		var mode string
+		var timeout, fk int
+		if err := c.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.QueryRowContext(ctx, `PRAGMA busy_timeout`).Scan(&timeout); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk); err != nil {
+			t.Fatal(err)
+		}
+		if mode != "wal" || timeout != 5000 || fk != 1 {
+			t.Errorf("connection %d: journal_mode=%s busy_timeout=%d foreign_keys=%d; want wal/5000/1", i, mode, timeout, fk)
+		}
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Golden path: every Store operation, plus the audit trail they leave
+// ---------------------------------------------------------------------------
+
+func TestGoldenPathEveryOperation(t *testing.T) {
+	db := openTest(t)
+	var s Store = db // compile-time: *DB still satisfies the full contract
+
+	// Projects
+	p := mustProject(t, db, "alpha")
+	again, err := s.GetOrCreateProject(ctx, "alpha", "alpha")
+	if err != nil || again.ID != p.ID {
+		t.Fatalf("GetOrCreateProject returned a different project: %v %v", again, err)
+	}
+	if got, err := s.GetProjectByID(ctx, p.ID); err != nil || got.Key != "alpha" {
+		t.Fatalf("GetProjectByID: %v %v", got, err)
+	}
+	projects, err := s.ListProjects(ctx)
+	if err != nil || len(projects) != 1 {
+		t.Fatalf("ListProjects: %v %v", projects, err)
+	}
+
+	// Items
+	three := 3
+	epic, err := s.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Type: "epic", Title: "Parser epic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := s.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, ParentID: epic.ID, Title: "Write the parser",
+		Description: "tokenizer first", Priority: &three})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Type != "task" || task.Status != "backlog" {
+		t.Errorf("CreateItem defaults: type=%s status=%s", task.Type, task.Status)
+	}
+	if got, err := s.GetItem(ctx, task.ID[:8]); err != nil || got.ID != task.ID {
+		t.Errorf("GetItem by prefix: %v %v", got, err)
+	}
+	if kids, _ := s.ListItems(ctx, ItemFilter{ProjectID: p.ID, ParentID: epic.ID}); len(kids) != 1 || kids[0].ID != task.ID {
+		t.Errorf("ListItems by parent: %v", kids)
+	}
+	if top, _ := s.ListItems(ctx, ItemFilter{ProjectID: p.ID, TopLevelOnly: true}); len(top) != 1 || top[0].ID != epic.ID {
+		t.Errorf("ListItems top-level: %v", top)
+	}
+	if found, _ := s.FindItems(ctx, p.ID, "parser"); len(found) == 0 {
+		t.Error("FindItems: no match for 'parser'")
+	}
+	if hits, _ := s.SearchItems(ctx, p.ID, "tokenizer"); len(hits) != 1 || hits[0].MatchedIn != "description" {
+		t.Errorf("SearchItems: %v", hits)
+	}
+
+	// UpdateItem changes only what it is given -- the partial-update property
+	// the 2026-08 field-erasure incidents were about (U1 in docs/ledger.md).
+	upd, err := s.UpdateItem(ctx, task.ID, UpdateItemParams{Label: ptr("core")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upd.Label.String != "core" || upd.Title != "Write the parser" || upd.Description.String != "tokenizer first" {
+		t.Errorf("UpdateItem touched fields it wasn't given: %+v", upd)
+	}
+	if _, err := s.UpdateItemStatus(ctx, task.ID, "in_progress"); err != nil {
+		t.Fatal(err)
+	}
+	bulk := s.BulkUpdateItemStatus(ctx, []string{epic.ID, task.ID, "no-such-item"}, "planned")
+	if len(bulk) != 3 || bulk[0].Error != nil || bulk[1].Error != nil || bulk[2].Error == nil {
+		t.Errorf("BulkUpdateItemStatus per-item results wrong: %+v", bulk)
+	}
+	if it, err := s.UpdateItemPriority(ctx, task.ID, 5); err != nil || it.Priority.Int64 != 5 {
+		t.Errorf("UpdateItemPriority: %v %v", it, err)
+	}
+	if it, err := s.UpdateItemAssignee(ctx, task.ID, "michael"); err != nil || it.Assignee.String != "michael" {
+		t.Errorf("UpdateItemAssignee: %v %v", it, err)
+	}
+
+	// Resources
+	res, err := s.AddResource(ctx, p.ID, task.ID, "https://example.com/spec", "spec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Label.String != "spec" {
+		t.Errorf("AddResource returned label %q; want %q (return value used to omit it)", res.Label.String, "spec")
+	}
+	if list, _ := s.ListResources(ctx, task.ID, ""); len(list) != 1 || list[0].UpdatedAt.Valid {
+		t.Errorf("ListResources: want 1 never-updated resource, got %+v", list)
+	}
+	if r, err := s.UpdateResource(ctx, res.ID, UpdateResourceParams{Label: ptr("design spec")}); err != nil ||
+		r.Label.String != "design spec" || r.URL != "https://example.com/spec" || !r.UpdatedAt.Valid {
+		t.Errorf("UpdateResource: %+v %v", r, err)
+	}
+
+	// Notes and timers
+	note, err := s.AddNote(ctx, AddNoteParams{ItemID: task.ID, Body: "first pass done"})
+	if err != nil || note.Type != NoteTypeComment {
+		t.Fatalf("AddNote: %v %v", note, err)
+	}
+	if n, err := s.UpdateNote(ctx, note.ID, UpdateNoteParams{Body: ptr("first pass done, tests next")}); err != nil ||
+		n.Body.String != "first pass done, tests next" {
+		t.Errorf("UpdateNote: %+v %v", n, err)
+	}
+	if _, err := s.StartTimer(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StopTimer(ctx, task.ID); err != nil {
+		t.Fatal(err)
+	}
+	notes, _ := s.ListNotes(ctx, task.ID, "")
+	var types []string
+	for _, n := range notes {
+		types = append(types, n.Type)
+	}
+	if strings.Join(types, ",") != "comment,time-started,time-ended" {
+		t.Errorf("ListNotes types = %v", types)
+	}
+
+	// Relations
+	other := mustItem(t, db, p.ID, "Review the parser")
+	if _, err := s.RelateItems(ctx, other.ID, task.ID, "depends_on"); err != nil {
+		t.Fatal(err)
+	}
+	if r := s.BulkRelateItems(ctx, []string{epic.ID}, task.ID, "related_to"); len(r) != 1 || r[0].Error != nil {
+		t.Errorf("BulkRelateItems: %+v", r)
+	}
+	if rels, _ := s.ListRelations(ctx, task.ID); len(rels) != 2 {
+		t.Errorf("ListRelations: want 2, got %d", len(rels))
+	}
+	if rels, _ := s.ListProjectRelations(ctx, p.ID); len(rels) != 2 {
+		t.Errorf("ListProjectRelations: want 2, got %d", len(rels))
+	}
+
+	// Cross-cutting
+	sum, err := s.SummarizeProject(ctx, p.ID, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sum.Counts["planned"] != 2 || sum.Counts["backlog"] != 1 || sum.TopPriority == nil || sum.TopPriority.ID != task.ID {
+		t.Errorf("SummarizeProject: counts=%v top=%v", sum.Counts, sum.TopPriority)
+	}
+	if entries, err := s.ListAuditLog(ctx, AuditFilter{EntityID: task.ID}); err != nil || len(entries) == 0 {
+		t.Errorf("ListAuditLog: %d entries, %v", len(entries), err)
+	}
+	if err := s.SoftDelete(ctx, "item", other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := s.ListItems(ctx, ItemFilter{ProjectID: p.ID}); len(live) != 2 {
+		t.Errorf("soft-deleted item still listed: %d live items", len(live))
+	}
+	if err := s.Restore(ctx, "item", other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if live, _ := s.ListItems(ctx, ItemFilter{ProjectID: p.ID}); len(live) != 3 {
+		t.Errorf("restored item not listed: %d live items", len(live))
+	}
+
+	// The audit trail: every mutation above left a row, every row names the
+	// client, and every create/update row says what happened. Empty detail
+	// on some entity types went unnoticed twice (2026-07-30 resources and
+	// relations; 2026-09-10 notes), so this checks all of them together.
+	rows, err := db.conn.Query(`SELECT entity_type, operation, COALESCE(detail, ''), COALESCE(client, '') FROM audit_log`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	for rows.Next() {
+		var et, op, detail, client string
+		if err := rows.Scan(&et, &op, &detail, &client); err != nil {
+			t.Fatal(err)
+		}
+		seen[et+" "+op] = true
+		if client != testClient {
+			t.Errorf("%s %s: client = %q, want %q", et, op, client, testClient)
+		}
+		if op != "deleted" && op != "restored" && detail == "" {
+			t.Errorf("%s %s: empty audit detail", et, op)
+		}
+	}
+	for _, want := range []string{
+		"project created", "item created", "item updated", "item status_changed", "item priority_changed",
+		"item assigned", "resource created", "resource updated", "note created", "note updated",
+		"item_relation created", "item deleted", "item restored",
+	} {
+		if !seen[want] {
+			t.Errorf("no audit row for %q", want)
+		}
+	}
+}
+
+func TestAuditClientIsNullWithoutResolver(t *testing.T) {
+	s, err := Open(Options{Path: filepath.Join(t.TempDir(), "ledger.db")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	db := s.(*DB)
+	p := mustProject(t, db, "beta")
+	for _, e := range auditRows(t, db, "project", p.ID) {
+		if e.Client.Valid {
+			t.Errorf("client = %q; want NULL when Options.Client is nil", e.Client.String)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Vocabulary enforcement
+// ---------------------------------------------------------------------------
+
+func TestVocabularyRejectedByValidation(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "gamma")
+	a, b := mustItem(t, db, p.ID, "a"), mustItem(t, db, p.ID, "b")
+
+	_, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Type: "bug"})
+	wantErrContaining(t, err, `invalid type "bug"`)
+	_, err = db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Status: "doing"})
+	wantErrContaining(t, err, `invalid status "doing"`)
+	_, err = db.UpdateItemStatus(ctx, a.ID, "doing")
+	wantErrContaining(t, err, `invalid status "doing"`)
+	_, err = db.RelateItems(ctx, a.ID, b.ID, "blocks")
+	wantErrContaining(t, err, `invalid relation_type "blocks"`)
+
+	// AddNote writes comments only. Timer events come from the timer
+	// functions, which enforce start/stop pairing.
+	_, err = db.AddNote(ctx, AddNoteParams{ItemID: a.ID, Type: NoteTypeTimeStarted, Body: "forged"})
+	wantErrContaining(t, err, "StartTimer/StopTimer")
+	_, err = db.AddNote(ctx, AddNoteParams{ItemID: a.ID, Type: "banana"})
+	wantErrContaining(t, err, `invalid note type "banana"`)
+
+	if notes, _ := db.ListNotes(ctx, a.ID, ""); len(notes) != 0 {
+		t.Errorf("a rejected AddNote still wrote %d note(s)", len(notes))
+	}
+	if rels, _ := db.ListRelations(ctx, a.ID); len(rels) != 0 {
+		t.Errorf("a rejected RelateItems still wrote %d relation(s)", len(rels))
+	}
+}
+
+// The triggers must hold even for writes that never touch this package.
+func TestVocabularyRejectedByTriggers(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "delta")
+	a, b := mustItem(t, db, p.ID, "a"), mustItem(t, db, p.ID, "b")
+	now := nowUTC()
+
+	cases := []struct {
+		name, sql string
+		args      []any
+		want      string
+	}{
+		{"insert item bad status", `INSERT INTO items (id, project_id, type, title, status, created_at, updated_at) VALUES ('i1', ?, 'task', 't', 'doing', ?, ?)`,
+			[]any{p.ID, now, now}, "items.status"},
+		{"insert item bad type", `INSERT INTO items (id, project_id, type, title, status, created_at, updated_at) VALUES ('i2', ?, 'bug', 't', 'backlog', ?, ?)`,
+			[]any{p.ID, now, now}, "items.type"},
+		{"update item bad status", `UPDATE items SET status = 'doing' WHERE id = ?`, []any{a.ID}, "items.status"},
+		{"update item bad type", `UPDATE items SET type = 'bug' WHERE id = ?`, []any{a.ID}, "items.type"},
+		{"insert bad relation", `INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at) VALUES ('r1', ?, ?, 'serves', ?)`,
+			[]any{a.ID, b.ID, now}, "item_relations.relation_type"},
+		{"insert bad note type", `INSERT INTO notes (id, item_id, type, created_at, updated_at) VALUES ('n1', ?, 'banana', ?, ?)`,
+			[]any{a.ID, now, now}, "notes.type"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := db.conn.Exec(c.sql, c.args...)
+			wantErrContaining(t, err, "ledger vocabulary: "+c.want)
+		})
+	}
+
+	// Control: a valid raw write is not blocked.
+	if _, err := db.conn.Exec(`INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at) VALUES ('r2', ?, ?, 'related_to', ?)`,
+		a.ID, b.ID, now); err != nil {
+		t.Errorf("valid raw relation insert rejected: %v", err)
+	}
+}
+
+// Rows that predate enforcement are left for a human decision, and must stay
+// repairable: soft delete and restore touch only deleted_at, so they must not
+// trip the relation_type trigger. Changing the value to another bad one must.
+func TestTriggersSparePreexistingRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	db := openAt(t, path)
+	p := mustProject(t, db, "epsilon")
+	a, b := mustItem(t, db, p.ID, "a"), mustItem(t, db, p.ID, "b")
+
+	// Recreate the real situation: a bad row written before the triggers
+	// existed.
+	if _, err := db.conn.Exec(`DROP TRIGGER ` + relationTriggerName("ins")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.Exec(`INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at) VALUES ('legacy', ?, ?, 'blocks', ?)`,
+		a.ID, b.ID, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: the missing trigger is reinstalled.
+	db2 := openAt(t, path)
+	var n int
+	db2.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name = ?`, relationTriggerName("ins")).Scan(&n)
+	if n != 1 {
+		t.Fatalf("relation insert trigger not reinstalled on reopen")
+	}
+
+	_, err := db2.conn.Exec(`UPDATE item_relations SET relation_type = 'serves' WHERE id = 'legacy'`)
+	wantErrContaining(t, err, "ledger vocabulary: item_relations.relation_type")
+
+	if err := db2.SoftDelete(ctx, "item_relation", "legacy"); err != nil {
+		t.Errorf("soft-deleting a pre-existing off-vocabulary row was blocked: %v", err)
+	}
+	if err := db2.Restore(ctx, "item_relation", "legacy"); err != nil {
+		t.Errorf("restoring a pre-existing off-vocabulary row was blocked: %v", err)
+	}
+	if _, err := db2.conn.Exec(`UPDATE item_relations SET relation_type = 'blocked_by' WHERE id = 'legacy'`); err != nil {
+		t.Errorf("repairing a pre-existing row to a valid value was blocked: %v", err)
+	}
+}
+
+func relationTriggerName(kind string) string {
+	for _, r := range vocabRules() {
+		if r.table == "item_relations" {
+			return r.triggerPrefix() + kind + "_" + r.suffix()
+		}
+	}
+	return ""
+}
+
+// A vocabulary change must replace the installed triggers. If an outdated
+// trigger survived, it would reject every value the new vocabulary added.
+func TestStaleVocabularyTriggerIsReplaced(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "zeta")
+	stale := "ledger_vocab_items_status_ins_deadbeef"
+	if _, err := db.conn.Exec(`CREATE TRIGGER ` + stale + ` BEFORE INSERT ON items WHEN NEW.status NOT IN ('backlog')
+		BEGIN SELECT RAISE(ABORT, 'stale vocabulary'); END`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Status: "done"})
+	wantErrContaining(t, err, "stale vocabulary")
+
+	if err := ensureVocabTriggers(db.conn); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	db.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name = ?`, stale).Scan(&n)
+	if n != 0 {
+		t.Errorf("stale trigger %s was not dropped", stale)
+	}
+	if _, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Status: "done"}); err != nil {
+		t.Errorf("valid status still rejected after replacing the stale trigger: %v", err)
+	}
+}
+
+func TestVocabReturnsCopies(t *testing.T) {
+	v := Vocab()
+	v.Statuses[0] = "mutated"
+	if Vocab().Statuses[0] != "backlog" {
+		t.Error("Vocab() exposed the package's own slice")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Editing notes and resources
+// ---------------------------------------------------------------------------
+
+func TestUpdateNote(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "eta")
+	it := mustItem(t, db, p.ID, "a")
+	note, err := db.AddNote(ctx, AddNoteParams{ItemID: it.ID, Body: "draft", URL: "https://x.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Unchanged value: no write, no audit row.
+	if _, err := db.UpdateNote(ctx, note.ID, UpdateNoteParams{Body: ptr("draft")}); err != nil {
+		t.Fatal(err)
+	}
+	if rows := auditRows(t, db, "note", note.ID); len(rows) != 1 {
+		t.Errorf("no-op update wrote an audit row: %d rows", len(rows))
+	}
+
+	// Clearing a field with "" is recorded as old -> new.
+	n, err := db.UpdateNote(ctx, note.ID, UpdateNoteParams{URL: ptr("")})
+	if err != nil || n.URL.Valid || n.Body.String != "draft" {
+		t.Fatalf("clear url: %+v %v", n, err)
+	}
+	rows := auditRows(t, db, "note", note.ID)
+	var detail map[string][2]string
+	if err := json.Unmarshal([]byte(rows[len(rows)-1].Detail.String), &detail); err != nil ||
+		detail["url"] != [2]string{"https://x.test", ""} {
+		t.Errorf("update audit detail = %q", rows[len(rows)-1].Detail.String)
+	}
+
+	_, err = db.UpdateNote(ctx, note.ID, UpdateNoteParams{})
+	wantErrContaining(t, err, "at least one")
+
+	timer, err := db.StartTimer(ctx, it.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.UpdateNote(ctx, timer.ID, UpdateNoteParams{Body: ptr("rewritten history")})
+	wantErrContaining(t, err, "timer event")
+
+	if err := db.SoftDelete(ctx, "note", note.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.UpdateNote(ctx, note.ID, UpdateNoteParams{Body: ptr("x")})
+	wantErrContaining(t, err, "restore it first")
+
+	_, err = db.UpdateNote(ctx, "no-such-note", UpdateNoteParams{Body: ptr("x")})
+	wantErrContaining(t, err, "not found")
+}
+
+func TestUpdateResource(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "theta")
+	it := mustItem(t, db, p.ID, "a")
+	r, err := db.AddResource(ctx, p.ID, it.ID, "https://a.test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.UpdateResource(ctx, r.ID, UpdateResourceParams{URL: ptr("")})
+	wantErrContaining(t, err, "cannot be cleared")
+
+	got, err := db.UpdateResource(ctx, r.ID, UpdateResourceParams{URL: ptr("https://b.test"), Label: ptr("docs")})
+	if err != nil || got.URL != "https://b.test" || got.Label.String != "docs" {
+		t.Fatalf("UpdateResource: %+v %v", got, err)
+	}
+	rows := auditRows(t, db, "resource", r.ID)
+	var detail map[string][2]string
+	json.Unmarshal([]byte(rows[len(rows)-1].Detail.String), &detail)
+	if detail["url"] != [2]string{"https://a.test", "https://b.test"} || detail["label"] != [2]string{"", "docs"} {
+		t.Errorf("update audit detail = %q", rows[len(rows)-1].Detail.String)
+	}
+
+	if err := db.SoftDelete(ctx, "resource", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.UpdateResource(ctx, r.ID, UpdateResourceParams{Label: ptr("x")})
+	wantErrContaining(t, err, "restore it first")
+}
+
+// A database created before resources.updated_at existed gains the column on
+// open, and its existing rows are left NULL -- not backfilled. Adding a column
+// must not rewrite data.
+func TestResourcesUpdatedAtMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE projects (id TEXT PRIMARY KEY, key TEXT UNIQUE NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+		`CREATE TABLE resources (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), item_id TEXT, url TEXT NOT NULL, label TEXT, created_at TEXT NOT NULL)`,
+		`INSERT INTO projects VALUES ('p1', 'old', 'old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+		`INSERT INTO resources VALUES ('r1', 'p1', NULL, 'https://old.test', 'old', '2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	db := openAt(t, path)
+	list, err := db.ListResources(ctx, "", "p1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListResources after migration: %v %v", list, err)
+	}
+	if list[0].UpdatedAt.Valid {
+		t.Errorf("existing row was backfilled: updated_at = %q", list[0].UpdatedAt.String)
+	}
+	if list[0].URL != "https://old.test" || list[0].Label.String != "old" || list[0].CreatedAt != "2026-01-01T00:00:00Z" {
+		t.Errorf("existing row changed by migration: %+v", list[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency across processes
+// ---------------------------------------------------------------------------
+
+// Regression test for 2026-09-07: with no busy timeout, 923 of 1000 writes
+// from 5 concurrent processes failed with SQLITE_BUSY. This mirrors how
+// mcp-local actually uses the store -- a fresh Open, one write and a Close
+// per tool call -- across separate OS processes, because SQLite file locking
+// between processes is the thing under test and goroutines in one process
+// would not exercise it.
+func TestConcurrentWritersAcrossProcesses(t *testing.T) {
+	if testing.Short() {
+		t.Skip("spawns child processes")
+	}
+	const procs, perProc = 5, 100
+	path := filepath.Join(t.TempDir(), "ledger.db")
+
+	// The parent opens first, as a deploy does, so the children run against
+	// an initialised WAL database -- the steady state every session sees.
+	parent := openAt(t, path)
+	p := mustProject(t, parent, "concurrency")
+
+	cmds := make([]*exec.Cmd, procs)
+	outs := make([]*strings.Builder, procs)
+	for i := range cmds {
+		cmd := exec.Command(os.Args[0], "-test.run=^$")
+		cmd.Env = append(os.Environ(),
+			"LEDGERCORE_WRITER=w"+strconv.Itoa(i),
+			"LEDGERCORE_PATH="+path,
+			"LEDGERCORE_PROJECT="+p.ID,
+			"LEDGERCORE_N="+strconv.Itoa(perProc),
+		)
+		outs[i] = &strings.Builder{}
+		cmd.Stdout, cmd.Stderr = outs[i], outs[i]
+		cmds[i] = cmd
+	}
+	for _, c := range cmds {
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, c := range cmds {
+		if err := c.Wait(); err != nil {
+			t.Errorf("writer %d failed (%v):\n%s", i, err, outs[i].String())
+		}
+	}
+
+	var items, audited int
+	parent.conn.QueryRow(`SELECT COUNT(*) FROM items WHERE project_id = ?`, p.ID).Scan(&items)
+	parent.conn.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE entity_type = 'item' AND client LIKE 'writer/%'`).Scan(&audited)
+	if items != procs*perProc || audited != procs*perProc {
+		t.Errorf("wrote %d items with %d audit rows; want %d of each", items, audited, procs*perProc)
+	}
+}
+
+// runWriter is the child-process side of TestConcurrentWritersAcrossProcesses.
+func runWriter() int {
+	worker := os.Getenv("LEDGERCORE_WRITER")
+	path, project := os.Getenv("LEDGERCORE_PATH"), os.Getenv("LEDGERCORE_PROJECT")
+	n, _ := strconv.Atoi(os.Getenv("LEDGERCORE_N"))
+	opts := Options{Path: path, Client: func(context.Context) string { return "writer/" + worker }}
+
+	failures := 0
+	for i := 0; i < n; i++ {
+		s, err := Open(opts)
+		if err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "open %d: %v\n", i, err)
+			continue
+		}
+		if _, err := s.CreateItem(context.Background(), CreateItemParams{ProjectID: project, Title: fmt.Sprintf("%s-%d", worker, i)}); err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "write %d: %v\n", i, err)
+		}
+		s.Close()
+	}
+	if failures > 0 {
+		fmt.Fprintf(os.Stderr, "%s: %d of %d writes failed\n", worker, failures, n)
+		return 1
+	}
+	return 0
+}

@@ -1,11 +1,17 @@
-// Package ledger provides the ledger domain's persistence contract (Store)
-// plus its only implementation today: a SQLite-backed DB, built via
-// SQLiteFactory. Typed query functions for projects, items, resources,
-// notes, item_relations, and audit_log are defined against *DB throughout
-// this package; Store exists so a future MySQL/PostgreSQL backend could
-// satisfy the same contract without changing any of the 20 ledger tool
-// handlers in internal/tools/ledger, which depend on Store, not *DB.
-package ledger
+// Package ledgercore is the ledger's persistence layer: the Store contract
+// plus its only implementation today, a SQLite-backed DB. Typed query
+// functions for projects, items, resources, notes, item_relations, and
+// audit_log are defined against *DB throughout this package.
+//
+// It is the single implementation of every ledger write -- validation,
+// audit-in-transaction, soft delete, id-prefix resolution -- shared by every
+// program that writes the ledger: mcp-local's MCP tools and ledger-server's
+// web UI. It was extracted from mcp-local/internal/store/ledger on
+// 2026-09-10 precisely so those two front doors could not drift apart.
+//
+// It deliberately knows nothing about any caller's transport. Who performed
+// a mutation is supplied by the caller through Options.Client.
+package ledgercore
 
 import (
 	"context"
@@ -49,10 +55,12 @@ type Store interface {
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
 	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
+	UpdateResource(ctx context.Context, id string, p UpdateResourceParams) (*Resource, error)
 
 	// Notes
 	AddNote(ctx context.Context, p AddNoteParams) (*Note, error)
 	ListNotes(ctx context.Context, itemID, projectID string) ([]Note, error)
+	UpdateNote(ctx context.Context, id string, p UpdateNoteParams) (*Note, error)
 	StartTimer(ctx context.Context, itemID string) (*Note, error)
 	StopTimer(ctx context.Context, itemID string) (*Note, error)
 
@@ -79,24 +87,46 @@ type Factory interface {
 	Open() (Store, error)
 }
 
-// SQLiteFactory creates SQLite-backed Store instances at the location
-// Path() resolves (LEDGER_DB_PATH, else XDG_DATA_HOME).
-type SQLiteFactory struct{}
+// Options configures Open.
+type Options struct {
+	// Path is the SQLite file to open. Empty means DefaultPath().
+	Path string
+
+	// Client names whoever is performing a mutation, for audit_log.client.
+	// It is called once per audit row, with the context of the call that
+	// caused it -- so a caller whose identity lives in the request context
+	// (mcp-local reads the MCP session's negotiated ClientInfo.Name from it)
+	// can resolve it per request, while a caller with a fixed identity can
+	// return a constant. nil, or a function returning "", records NULL.
+	Client func(context.Context) string
+}
+
+// SQLiteFactory creates SQLite-backed Store instances using Options.
+type SQLiteFactory struct {
+	Options Options
+}
 
 // Open implements Factory.
-func (SQLiteFactory) Open() (Store, error) {
-	return open()
+func (f SQLiteFactory) Open() (Store, error) {
+	return Open(f.Options)
 }
 
 // DB wraps a SQLite connection. It implements Store.
 type DB struct {
-	conn *sql.DB
+	conn   *sql.DB
+	client func(context.Context) string
 }
 
-// Path resolves the ledger SQLite file location.
+// DefaultPath resolves the ledger SQLite file location.
 // Uses LEDGER_DB_PATH if set; otherwise $XDG_DATA_HOME/mcp-local/ledger.db,
 // falling back to ~/.local/share/mcp-local/ledger.db if XDG_DATA_HOME is unset.
-func Path() (string, error) {
+//
+// The "mcp-local" directory name is historical -- the ledger lived inside
+// mcp-local when this path was chosen -- and is kept deliberately: every
+// program that opens the ledger must resolve the SAME file, and renaming the
+// directory would silently point new builds at an empty database while the
+// real data sat untouched at the old path.
+func DefaultPath() (string, error) {
 	if p := os.Getenv("LEDGER_DB_PATH"); p != "" {
 		return p, nil
 	}
@@ -111,19 +141,21 @@ func Path() (string, error) {
 	return filepath.Join(base, "mcp-local", "ledger.db"), nil
 }
 
-// Open is a convenience wrapper around SQLiteFactory{}.Open() -- kept so the
-// 20 existing ledger tool handlers (each calling ledgerstore.Open()) need no
-// changes; only their inferred variable type changed, from *DB to Store.
-func Open() (Store, error) {
-	return SQLiteFactory{}.Open()
+// Open opens the ledger at opts.Path (or DefaultPath() if empty).
+func Open(opts Options) (Store, error) {
+	return open(opts)
 }
 
 // open resolves the database path, ensures its parent directory exists,
 // opens the connection, locks down file permissions, and applies the schema.
-func open() (*DB, error) {
-	path, err := Path()
-	if err != nil {
-		return nil, err
+func open(opts Options) (*DB, error) {
+	path := opts.Path
+	if path == "" {
+		p, err := DefaultPath()
+		if err != nil {
+			return nil, err
+		}
+		path = p
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("creating db directory: %w", err)
@@ -222,6 +254,10 @@ func open() (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	if err := ensureColumn(conn, "resources", "updated_at", "TEXT"); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	// component_id (a foreign key) was replaced by component (a plain
 	// denormalized string) before any external release existed to depend on
 	// the old shape -- see docs/ledger.md. A database that already ran the
@@ -250,7 +286,14 @@ func open() (*DB, error) {
 		return nil, fmt.Errorf("creating component index: %w", err)
 	}
 
-	return &DB{conn: conn}, nil
+	// Last, after every migration: the triggers reference columns that the
+	// migrations above may have just added.
+	if err := ensureVocabTriggers(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return &DB{conn: conn, client: opts.Client}, nil
 }
 
 // ensureColumn adds column to table if it doesn't already exist. SQLite's

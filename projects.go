@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import (
 	"context"
@@ -108,7 +108,7 @@ func (db *DB) insertProject(ctx context.Context, key, name string) (*Project, er
 	}
 
 	detail, _ := json.Marshal(map[string]string{"key": key, "name": name})
-	if err := insertAudit(ctx, tx, "project", id, "created", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "project", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 

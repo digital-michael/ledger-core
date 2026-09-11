@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import (
 	"context"
@@ -46,7 +46,7 @@ func (db *DB) SoftDelete(ctx context.Context, entityType, id string) error {
 		return fmt.Errorf("%s %q not found or already deleted", entityType, id)
 	}
 
-	if err := insertAudit(ctx, tx, entityType, id, "deleted", ""); err != nil {
+	if err := db.insertAudit(ctx, tx, entityType, id, "deleted", ""); err != nil {
 		return fmt.Errorf("writing audit log: %w", err)
 	}
 	return tx.Commit()
@@ -78,7 +78,7 @@ func (db *DB) Restore(ctx context.Context, entityType, id string) error {
 		return fmt.Errorf("%s %q not found or not deleted", entityType, id)
 	}
 
-	if err := insertAudit(ctx, tx, entityType, id, "restored", ""); err != nil {
+	if err := db.insertAudit(ctx, tx, entityType, id, "restored", ""); err != nil {
 		return fmt.Errorf("writing audit log: %w", err)
 	}
 	return tx.Commit()

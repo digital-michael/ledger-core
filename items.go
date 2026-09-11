@@ -1,4 +1,4 @@
-package ledger
+package ledgercore
 
 import (
 	"context"
@@ -61,22 +61,6 @@ type CreateItemParams struct {
 
 const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at`
 
-// validItemTypesDesc lists the allowed values for CreateItemParams.Type, for
-// use in the rejection error message.
-const validItemTypesDesc = "epic, story, task, spike, plan, defect, release, incident, component"
-
-// validItemTypes covers the full work lifecycle: discovery (spike),
-// planning (epic, story, plan), implementation (task), quality (defect),
-// deployment (release), and support (incident) -- plus component, a
-// structural/specification marker orthogonal to the rest (see Item's doc
-// comment). Enforced only at creation -- Type has no update path through any
-// tool, so this is the only place it needs to be checked.
-var validItemTypes = map[string]bool{
-	"epic": true, "story": true, "task": true, "spike": true,
-	"plan": true, "defect": true, "release": true, "incident": true,
-	"component": true,
-}
-
 // validateComponentTitle confirms title exactly matches some existing,
 // non-deleted type=component item, in any project -- component assignment
 // is deliberately cross-project-tolerant, matching item_relations. Unlike
@@ -124,19 +108,6 @@ func validateComponentTitleUnique(ctx context.Context, tx *sql.Tx, projectID, ti
 		return fmt.Errorf("checking component title uniqueness: %w", err)
 	}
 	return fmt.Errorf("a component titled %q already exists in this project (id=%s)", title, existingID)
-}
-
-// validStatusesDesc lists the allowed values for CreateItemParams.Status and
-// UpdateItemStatus's status, for use in rejection error messages.
-const validStatusesDesc = "backlog, planned, in_progress, blocked, done"
-
-// validStatuses mirrors validItemTypes' shape. Creating an item already-done
-// (or already in_progress, etc.) is a real, common need -- e.g. logging past
-// work -- so Status is a real input to CreateItem, not always hardcoded, and
-// needs the same validation Type already has.
-var validStatuses = map[string]bool{
-	"backlog": true, "planned": true, "in_progress": true,
-	"blocked": true, "done": true,
 }
 
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
@@ -200,7 +171,7 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	detail, _ := json.Marshal(map[string]string{"title": p.Title, "type": p.Type})
-	if err := insertAudit(ctx, tx, "item", id, "created", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 
@@ -416,7 +387,7 @@ func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, e
 	}
 
 	detail, _ := json.Marshal(map[string]string{"from": oldStatus, "to": status})
-	if err := insertAudit(ctx, tx, "item", id, "status_changed", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item", id, "status_changed", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 
@@ -475,7 +446,7 @@ func (db *DB) UpdateItemPriority(ctx context.Context, id string, priority int) (
 		oldVal = fmt.Sprintf("%d", oldPriority.Int64)
 	}
 	detail, _ := json.Marshal(map[string]string{"from": oldVal, "to": fmt.Sprintf("%d", priority)})
-	if err := insertAudit(ctx, tx, "item", id, "priority_changed", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item", id, "priority_changed", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 
@@ -575,7 +546,7 @@ func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*I
 	}
 
 	detail, _ := json.Marshal(changes)
-	if err := insertAudit(ctx, tx, "item", id, "updated", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item", id, "updated", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 
@@ -612,7 +583,7 @@ func (db *DB) UpdateItemAssignee(ctx context.Context, id, assignee string) (*Ite
 	}
 
 	detail, _ := json.Marshal(map[string]string{"from": oldAssignee.String, "to": assignee})
-	if err := insertAudit(ctx, tx, "item", id, "assigned", string(detail)); err != nil {
+	if err := db.insertAudit(ctx, tx, "item", id, "assigned", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 

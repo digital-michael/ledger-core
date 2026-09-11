@@ -48,8 +48,14 @@ CREATE TABLE IF NOT EXISTS resources (
   url        TEXT NOT NULL,
   label      TEXT,
   created_at TEXT NOT NULL,
+  updated_at TEXT,
   deleted_at TEXT
 );
+-- resources.updated_at: NULL means "never updated". Added 2026-09-10 with
+-- UpdateResource; an existing database gets the column via store.go's
+-- ensureColumn() and its existing rows are deliberately NOT backfilled --
+-- a NULL is the honest value for a row nobody has edited, and adding the
+-- column should not rewrite any data.
 
 CREATE TABLE IF NOT EXISTS notes (
   id         TEXT PRIMARY KEY,
