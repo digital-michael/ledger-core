@@ -39,6 +39,12 @@ type Item struct {
 	Component   sql.NullString
 	CreatedAt   string
 	UpdatedAt   string
+	// DeletedAt is set when the item is soft-deleted. List and search
+	// queries already exclude deleted items, so in practice only GetItem --
+	// which deliberately still returns them, for inspection before a restore
+	// -- hands back a set value. Exposed 2026-09-10 so ledger-server can show
+	// a deleted item as deleted rather than as live.
+	DeletedAt sql.NullString
 }
 
 // CreateItemParams are the inputs to CreateItem. Type defaults to "task",
@@ -59,7 +65,7 @@ type CreateItemParams struct {
 	Component   string
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at, deleted_at`
 
 // validateComponentTitle confirms title exactly matches some existing,
 // non-deleted type=component item, in any project -- component assignment
@@ -113,7 +119,7 @@ func validateComponentTitleUnique(ctx context.Context, tx *sql.Tx, projectID, ti
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt)
+		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +235,7 @@ func (db *DB) resolveItemID(ctx context.Context, id string) (string, error) {
 
 	switch len(matches) {
 	case 0:
-		return "", fmt.Errorf("item %q not found", id)
+		return "", &lookupError{msg: fmt.Sprintf("item %q not found", id), kind: ErrNotFound}
 	case 1:
 		return matches[0].id, nil
 	default:
@@ -238,7 +244,7 @@ func (db *DB) resolveItemID(ctx context.Context, id string) (string, error) {
 		for _, m := range matches {
 			fmt.Fprintf(&sb, "  %s %q\n", m.id, m.title)
 		}
-		return "", errors.New(strings.TrimRight(sb.String(), "\n"))
+		return "", &lookupError{msg: strings.TrimRight(sb.String(), "\n"), kind: ErrAmbiguousID}
 	}
 }
 
@@ -252,7 +258,7 @@ func (db *DB) GetItem(ctx context.Context, id string) (*Item, error) {
 	row := db.conn.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, resolvedID)
 	it, err := scanItem(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("item %q not found", id)
+		return nil, &lookupError{msg: fmt.Sprintf("item %q not found", id), kind: ErrNotFound}
 	}
 	if err != nil {
 		return nil, err

@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -859,4 +860,62 @@ func TestAttachingToDeletedEntitiesIsRefused(t *testing.T) {
 	wantErrContaining(t, err, wantProject)
 	_, err = db.AddResource(ctx, q.ID, "", "https://x.test", "")
 	wantErrContaining(t, err, wantProject)
+}
+
+// ---------------------------------------------------------------------------
+// What ledger-server needs from reads (Phase 1a)
+// ---------------------------------------------------------------------------
+
+func TestGetItemReportsDeletedAndClassifiesLookupFailures(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "mu")
+	it := mustItem(t, db, p.ID, "x")
+
+	got, _ := db.GetItem(ctx, it.ID)
+	if got.DeletedAt.Valid {
+		t.Error("live item reports DeletedAt")
+	}
+	db.SoftDelete(ctx, "item", it.ID)
+	got, err := db.GetItem(ctx, it.ID)
+	if err != nil || !got.DeletedAt.Valid {
+		t.Errorf("GetItem on a deleted item: DeletedAt=%v err=%v; want it returned, marked deleted", got, err)
+	}
+	if live, _ := db.ListItems(ctx, ItemFilter{ProjectID: p.ID}); len(live) != 0 {
+		t.Error("ListItems returned a deleted item")
+	}
+
+	_, err = db.GetItem(ctx, "ffffffff-no-such-item")
+	if !errors.Is(err, ErrNotFound) || errors.Is(err, ErrAmbiguousID) {
+		t.Errorf("not-found lookup: %v", err)
+	}
+	if err.Error() != `item "ffffffff-no-such-item" not found` {
+		t.Errorf("not-found message changed: %q", err.Error())
+	}
+
+	// Force an ambiguous prefix: two ids sharing a first character is
+	// guaranteed across 17 items (16 hex digits, pigeonhole).
+	seen := map[byte]bool{}
+	var shared string
+	for i := 0; shared == "" && i < 17; i++ {
+		c := mustItem(t, db, p.ID, fmt.Sprintf("m%d", i)).ID[0]
+		if seen[c] {
+			shared = string(c)
+		}
+		seen[c] = true
+	}
+	_, err = db.GetItem(ctx, shared)
+	if !errors.Is(err, ErrAmbiguousID) || !strings.Contains(err.Error(), "matches more than one item") {
+		t.Errorf("ambiguous lookup: %v", err)
+	}
+}
+
+func TestItemURL(t *testing.T) {
+	t.Setenv("LEDGER_SERVER_URL", "")
+	if got := ItemURL("abc"); got != "http://127.0.0.1:8090/t/abc" {
+		t.Errorf("default: %q", got)
+	}
+	t.Setenv("LEDGER_SERVER_URL", "http://ledger.local:9000/ ")
+	if got := ItemURL("abc"); got != "http://ledger.local:9000/t/abc" {
+		t.Errorf("override: %q", got)
+	}
 }
