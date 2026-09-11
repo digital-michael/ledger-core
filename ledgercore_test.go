@@ -639,7 +639,10 @@ func TestResourcesUpdatedAtMigration(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // Regression test for 2026-09-07: with no busy timeout, 923 of 1000 writes
-// from 5 concurrent processes failed with SQLITE_BUSY. This mirrors how
+// from 5 concurrent processes failed with SQLITE_BUSY. Each writer does both
+// shapes of transaction: a create, and an update that reads the row before
+// writing it. The second shape needs BEGIN IMMEDIATE as well as the busy
+// timeout (see store.go) and went untested until 2026-09-10. This mirrors how
 // mcp-local actually uses the store -- a fresh Open, one write and a Close
 // per tool call -- across separate OS processes, because SQLite file locking
 // between processes is the thing under test and goroutines in one process
@@ -681,11 +684,13 @@ func TestConcurrentWritersAcrossProcesses(t *testing.T) {
 		}
 	}
 
-	var items, audited int
+	var items, done, audited int
 	parent.conn.QueryRow(`SELECT COUNT(*) FROM items WHERE project_id = ?`, p.ID).Scan(&items)
+	parent.conn.QueryRow(`SELECT COUNT(*) FROM items WHERE project_id = ? AND status = 'done'`, p.ID).Scan(&done)
 	parent.conn.QueryRow(`SELECT COUNT(*) FROM audit_log WHERE entity_type = 'item' AND client LIKE 'writer/%'`).Scan(&audited)
-	if items != procs*perProc || audited != procs*perProc {
-		t.Errorf("wrote %d items with %d audit rows; want %d of each", items, audited, procs*perProc)
+	if items != procs*perProc || done != procs*perProc || audited != 2*procs*perProc {
+		t.Errorf("created %d, updated %d, audited %d; want %d, %d, %d",
+			items, done, audited, procs*perProc, procs*perProc, 2*procs*perProc)
 	}
 }
 
@@ -704,9 +709,23 @@ func runWriter() int {
 			fmt.Fprintf(os.Stderr, "open %d: %v\n", i, err)
 			continue
 		}
-		if _, err := s.CreateItem(context.Background(), CreateItemParams{ProjectID: project, Title: fmt.Sprintf("%s-%d", worker, i)}); err != nil {
+		it, err := s.CreateItem(context.Background(), CreateItemParams{ProjectID: project, Title: fmt.Sprintf("%s-%d", worker, i)})
+		s.Close()
+		if err != nil {
 			failures++
-			fmt.Fprintf(os.Stderr, "write %d: %v\n", i, err)
+			fmt.Fprintf(os.Stderr, "create %d: %v\n", i, err)
+			continue
+		}
+		// A separate open, as a second tool call would be: read-then-write.
+		s, err = Open(opts)
+		if err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "open for update %d: %v\n", i, err)
+			continue
+		}
+		if _, err := s.UpdateItemStatus(context.Background(), it.ID, "done"); err != nil {
+			failures++
+			fmt.Fprintf(os.Stderr, "update %d: %v\n", i, err)
 		}
 		s.Close()
 	}
@@ -765,4 +784,79 @@ func TestDeletedItemIsReadOnlyUntilRestored(t *testing.T) {
 	if _, err := db.UpdateItemStatus(ctx, it.ID, "done"); err != nil {
 		t.Errorf("restored item still refused edits: %v", err)
 	}
+}
+
+// Extended 2026-09-10: attaching anything to a deleted item edits it, so every
+// attach path is refused too -- and the same for a deleted project. Cleaning
+// up (soft-deleting a relation that points at a deleted item) must still work.
+func TestAttachingToDeletedEntitiesIsRefused(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "kappa")
+	live, gone := mustItem(t, db, p.ID, "live"), mustItem(t, db, p.ID, "gone")
+	oldRel, err := db.RelateItems(ctx, live.ID, gone.ID, "related_to")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StartTimer(ctx, gone.ID); err != nil { // a timer left running at delete time
+		t.Fatal(err)
+	}
+	if err := db.SoftDelete(ctx, "item", gone.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	const want = "is deleted; restore it first (ledger_restore entity_type=item"
+	_, err = db.AddNote(ctx, AddNoteParams{ItemID: gone.ID, Body: "x"})
+	wantErrContaining(t, err, want)
+	_, err = db.AddResource(ctx, p.ID, gone.ID, "https://x.test", "")
+	wantErrContaining(t, err, want)
+	_, err = db.StartTimer(ctx, gone.ID)
+	wantErrContaining(t, err, want) // not "timer already running"
+	_, err = db.StopTimer(ctx, gone.ID)
+	wantErrContaining(t, err, want)
+	_, err = db.RelateItems(ctx, live.ID, gone.ID, "depends_on")
+	wantErrContaining(t, err, want)
+	_, err = db.RelateItems(ctx, gone.ID, live.ID, "depends_on")
+	wantErrContaining(t, err, want)
+	_, err = db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, ParentID: gone.ID, Title: "child"})
+	wantErrContaining(t, err, want)
+
+	var notes, resources, relations, items int
+	db.conn.QueryRow(`SELECT COUNT(*) FROM notes WHERE item_id = ?`, gone.ID).Scan(&notes)
+	db.conn.QueryRow(`SELECT COUNT(*) FROM resources WHERE item_id = ?`, gone.ID).Scan(&resources)
+	db.conn.QueryRow(`SELECT COUNT(*) FROM item_relations WHERE from_item_id = ? OR to_item_id = ?`, gone.ID, gone.ID).Scan(&relations)
+	db.conn.QueryRow(`SELECT COUNT(*) FROM items WHERE parent_id = ?`, gone.ID).Scan(&items)
+	if notes != 1 || resources != 0 || relations != 1 || items != 0 {
+		t.Errorf("refused writes left rows behind: notes=%d (want the 1 pre-delete timer) resources=%d relations=%d children=%d",
+			notes, resources, relations, items)
+	}
+
+	// Cleanup is still possible: an existing relation to a deleted item can be
+	// soft-deleted, and so can the leftover itself be restored.
+	if err := db.SoftDelete(ctx, "item_relation", oldRel.ID); err != nil {
+		t.Errorf("soft-deleting a relation to a deleted item was blocked: %v", err)
+	}
+
+	// Restore re-enables every attach path.
+	if err := db.Restore(ctx, "item", gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.StopTimer(ctx, gone.ID); err != nil {
+		t.Errorf("restored item: StopTimer: %v", err)
+	}
+	if _, err := db.AddNote(ctx, AddNoteParams{ItemID: gone.ID, Body: "back"}); err != nil {
+		t.Errorf("restored item: AddNote: %v", err)
+	}
+
+	// Deleted project: nothing new can be added to it.
+	q := mustProject(t, db, "lambda")
+	if err := db.SoftDelete(ctx, "project", q.ID); err != nil {
+		t.Fatal(err)
+	}
+	const wantProject = "is deleted; restore it first (ledger_restore entity_type=project"
+	_, err = db.CreateItem(ctx, CreateItemParams{ProjectID: q.ID, Title: "x"})
+	wantErrContaining(t, err, wantProject)
+	_, err = db.AddNote(ctx, AddNoteParams{ProjectID: q.ID, Body: "x"})
+	wantErrContaining(t, err, wantProject)
+	_, err = db.AddResource(ctx, q.ID, "", "https://x.test", "")
+	wantErrContaining(t, err, wantProject)
 }

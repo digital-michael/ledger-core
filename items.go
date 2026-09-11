@@ -142,6 +142,13 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 	defer tx.Rollback()
 
+	// A new child changes its parent; a new item changes its project.
+	if err := refuseIfItemDeleted(ctx, tx, p.ParentID); err != nil {
+		return nil, err
+	}
+	if err := refuseIfProjectDeleted(ctx, tx, p.ProjectID); err != nil {
+		return nil, err
+	}
 	if p.Component != "" {
 		if err := validateComponentTitle(ctx, tx, p.Component); err != nil {
 			return nil, err

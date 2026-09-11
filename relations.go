@@ -33,6 +33,16 @@ func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string
 	}
 	defer tx.Rollback()
 
+	// Either end: a new relation changes both items' relation sets. Existing
+	// relations are untouched by a delete (no cascade) and can still be
+	// soft-deleted themselves, which is how leftovers get cleaned up.
+	if err := refuseIfItemDeleted(ctx, tx, fromID); err != nil {
+		return nil, err
+	}
+	if err := refuseIfItemDeleted(ctx, tx, toID); err != nil {
+		return nil, err
+	}
+
 	id := uuid.NewString()
 	now := nowUTC()
 	_, err = tx.ExecContext(ctx,

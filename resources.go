@@ -32,6 +32,13 @@ func (db *DB) AddResource(ctx context.Context, projectID, itemID, url, label str
 	}
 	defer tx.Rollback()
 
+	if err := refuseIfItemDeleted(ctx, tx, itemID); err != nil {
+		return nil, err
+	}
+	if err := refuseIfProjectDeleted(ctx, tx, projectID); err != nil {
+		return nil, err
+	}
+
 	id := uuid.NewString()
 	now := nowUTC()
 	_, err = tx.ExecContext(ctx,

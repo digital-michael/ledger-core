@@ -193,10 +193,24 @@ func open(opts Options) (*DB, error) {
 	// exclusive lock and is therefore the statement most likely to be blocked
 	// -- the driver guarantees that ordering by pushing busy_timeout to the
 	// front of the _pragma list regardless of the order given here.
+	//
+	// _txlock=immediate: every transaction begins as BEGIN IMMEDIATE, taking
+	// the write lock up front. Without it, a transaction that READS before it
+	// WRITES (every update here: look up the row, then change it) holds a read
+	// snapshot and must upgrade to a write lock -- and in WAL mode SQLite
+	// refuses that upgrade immediately with SQLITE_BUSY rather than invoking
+	// the busy timeout (waiting could deadlock), or with SQLITE_BUSY_SNAPSHOT
+	// (517) if another writer committed since the read. busy_timeout alone
+	// therefore protected only write-first transactions. Found 2026-09-10 when
+	// adding "is it deleted?" checks made CreateItem read first: the
+	// multi-process test dropped from 500/500 to 482/500. The update paths had
+	// always been exposed; the 2026-09-07 tests only exercised creates.
+	// Every transaction in this package writes, so immediate costs nothing.
 	dsn := "file:" + url.PathEscape(path) +
 		"?_pragma=busy_timeout(5000)" +
 		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=foreign_keys(ON)"
+		"&_pragma=foreign_keys(ON)" +
+		"&_txlock=immediate"
 
 	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {

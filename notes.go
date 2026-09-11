@@ -79,6 +79,12 @@ func (db *DB) AddNote(ctx context.Context, p AddNoteParams) (*Note, error) {
 // StopTimer — the one place a notes row and its audit_log entry are
 // written, in the caller's transaction.
 func (db *DB) insertNote(ctx context.Context, tx *sql.Tx, p AddNoteParams) (*Note, error) {
+	if err := refuseIfItemDeleted(ctx, tx, p.ItemID); err != nil {
+		return nil, err
+	}
+	if err := refuseIfProjectDeleted(ctx, tx, p.ProjectID); err != nil {
+		return nil, err
+	}
 	id := uuid.NewString()
 	now := nowUTC()
 	_, err := tx.ExecContext(ctx,
@@ -161,6 +167,9 @@ func (db *DB) StartTimer(ctx context.Context, itemID string) (*Note, error) {
 	}
 	defer tx.Rollback()
 
+	if err := refuseIfItemDeleted(ctx, tx, itemID); err != nil {
+		return nil, err
+	}
 	open, err := timerIsOpen(ctx, tx, itemID)
 	if err != nil {
 		return nil, err
@@ -188,6 +197,9 @@ func (db *DB) StopTimer(ctx context.Context, itemID string) (*Note, error) {
 	}
 	defer tx.Rollback()
 
+	if err := refuseIfItemDeleted(ctx, tx, itemID); err != nil {
+		return nil, err
+	}
 	open, err := timerIsOpen(ctx, tx, itemID)
 	if err != nil {
 		return nil, err
