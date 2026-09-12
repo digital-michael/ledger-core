@@ -71,6 +71,7 @@ type Store interface {
 	ListProjectRelations(ctx context.Context, projectID string) ([]ItemRelation, error)
 
 	// Cross-cutting
+	HealthFindings(ctx context.Context) ([]Finding, error)
 	SummarizeProject(ctx context.Context, projectID, projectKey string) (*ProjectSummary, error)
 	ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, error)
 	SoftDelete(ctx context.Context, entityType, id string) error

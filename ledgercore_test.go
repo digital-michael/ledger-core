@@ -990,3 +990,136 @@ func TestSearchPatterns(t *testing.T) {
 		t.Errorf("FindItems wildcard: %v %v", found, err)
 	}
 }
+
+// The ledger's own linter. Each case below is a problem that actually
+// occurred in the live database at some point.
+func TestHealthFindings(t *testing.T) {
+	db := openTest(t)
+	byCheck := func() map[string][]Finding {
+		t.Helper()
+		found, err := db.HealthFindings(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string][]Finding{}
+		for _, f := range found {
+			out[f.Check] = append(out[f.Check], f)
+		}
+		return out
+	}
+
+	// A healthy ledger reports nothing.
+	good := mustProject(t, db, "good")
+	keeper := mustItem(t, db, good.ID, "keeper")
+	if got := byCheck(); len(got) != 0 {
+		t.Fatalf("clean ledger reported %v", got)
+	}
+
+	// 1. An empty project.
+	empty := mustProject(t, db, "project=oops")
+	// 2. A live ticket whose project is deleted.
+	gone := mustProject(t, db, "gone")
+	stranded := mustItem(t, db, gone.ID, "stranded")
+	if err := db.SoftDelete(ctx, "project", gone.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 3. A live ticket under a deleted parent.
+	parent := mustItem(t, db, good.ID, "parent")
+	child, err := db.CreateItem(ctx, CreateItemParams{ProjectID: good.ID, ParentID: parent.ID, Title: "child"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 4. A relation left pointing at a deleted ticket.
+	rel, err := db.RelateItems(ctx, keeper.ID, parent.ID, "related_to")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SoftDelete(ctx, "item", parent.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 5. An off-vocabulary value from before enforcement: drop the trigger,
+	//    write one, and put the trigger back.
+	if _, err := db.conn.Exec(`DROP TRIGGER ` + relationTriggerName("ins")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.Exec(`INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at)
+		VALUES ('legacy', ?, ?, 'serves', ?)`, keeper.ID, child.ID, nowUTC()); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureVocabTriggers(db.conn); err != nil {
+		t.Fatal(err)
+	}
+	// 6. A timer nobody stopped.
+	if _, err := db.StartTimer(ctx, keeper.ID); err != nil {
+		t.Fatal(err)
+	}
+	// 7. A component name that no longer resolves.
+	if _, err := db.CreateItem(ctx, CreateItemParams{ProjectID: good.ID, Type: "component", Title: "auth"}); err != nil {
+		t.Fatal(err)
+	}
+	orphanComponent, err := db.CreateItem(ctx, CreateItemParams{ProjectID: good.ID, Title: "uses auth", Component: "auth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var componentID string
+	db.conn.QueryRow(`SELECT id FROM items WHERE type='component' AND title='auth'`).Scan(&componentID)
+	if err := db.SoftDelete(ctx, "item", componentID); err != nil {
+		t.Fatal(err)
+	}
+
+	got := byCheck()
+	for _, c := range []struct {
+		check, entity string
+		want          int
+	}{
+		{"empty_project", empty.ID, 1},
+		{"item_in_deleted_project", stranded.ID, 1},
+		{"deleted_parent", child.ID, 1},
+		{"dangling_relation", rel.ID, 1},
+		{"off_vocabulary", "legacy", 1},
+		{"running_timer", keeper.ID, 1},
+		{"missing_component", orphanComponent.ID, 1},
+	} {
+		findings := got[c.check]
+		if len(findings) != c.want {
+			t.Errorf("%s: %d findings, want %d (%+v)", c.check, len(findings), c.want, findings)
+			continue
+		}
+		if findings[0].EntityID != c.entity {
+			t.Errorf("%s: reported %s, want %s", c.check, findings[0].EntityID, c.entity)
+		}
+		if findings[0].Detail == "" || findings[0].Title == "" {
+			t.Errorf("%s: finding needs a title and an explanation: %+v", c.check, findings[0])
+		}
+		// Everything except an off-vocabulary value has one exact fix; that
+		// one needs a person to decide what it meant.
+		if (c.check == "off_vocabulary") != (findings[0].Fix == "") {
+			t.Errorf("%s: Fix = %q", c.check, findings[0].Fix)
+		}
+	}
+
+	// Reporting is read-only.
+	before, _ := db.ListAuditLog(ctx, AuditFilter{})
+	db.HealthFindings(ctx)
+	after, _ := db.ListAuditLog(ctx, AuditFilter{})
+	if len(after) != len(before) {
+		t.Errorf("running the checks wrote %d audit row(s)", len(after)-len(before))
+	}
+
+	// Acting on a finding clears it.
+	if _, err := db.StopTimer(ctx, keeper.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SoftDelete(ctx, "item_relation", rel.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SoftDelete(ctx, "project", empty.ID); err != nil {
+		t.Fatal(err)
+	}
+	got = byCheck()
+	for _, check := range []string{"running_timer", "dangling_relation", "empty_project"} {
+		if len(got[check]) != 0 {
+			t.Errorf("%s still reported after it was fixed: %+v", check, got[check])
+		}
+	}
+}
