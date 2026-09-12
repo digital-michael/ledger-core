@@ -919,3 +919,74 @@ func TestItemURL(t *testing.T) {
 		t.Errorf("override: %q", got)
 	}
 }
+
+// Search is "contains", with * and ? as the wildcards people type, and % and
+// _ treated literally -- SQLite's LIKE would otherwise make "50%" match
+// everything after "50". (2026-09-11, from review feedback that search did
+// not do text or wildcard matching.)
+func TestSearchPatterns(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "search")
+	mk := func(title, desc string) string {
+		it, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: title, Description: desc})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return it.ID
+	}
+	parser := mk("Write the parser", "tokenizer first")
+	report := mk("Coverage at 50% of statements", "")
+	noted := mk("Unrelated", "")
+	if _, err := db.AddNote(ctx, AddNoteParams{ItemID: noted, Body: "the parser needs a lexer"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(q string) []string {
+		t.Helper()
+		res, err := db.SearchItems(ctx, p.ID, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, r := range res {
+			out = append(out, r.ItemID+":"+r.MatchedIn)
+		}
+		return out
+	}
+	has := func(got []string, want string) bool {
+		for _, g := range got {
+			if g == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	if got := ids("parser"); !has(got, parser+":title") || !has(got, noted+":note") || len(got) != 2 {
+		t.Errorf("plain substring: %v", got)
+	}
+	if got := ids("tokenizer"); !has(got, parser+":description") {
+		t.Errorf("description match: %v", got)
+	}
+	if got := ids("Write*parser"); !has(got, parser+":title") {
+		t.Errorf("* wildcard: %v", got)
+	}
+	if got := ids("part?"); len(got) != 0 {
+		t.Errorf("? matches exactly one character, so 'part?' shouldn't match 'parser': %v", got)
+	}
+	if got := ids("parse?"); !has(got, parser+":title") {
+		t.Errorf("? wildcard: %v", got)
+	}
+	// The bug this guards: '%' as a literal, not "match anything".
+	if got := ids("50%"); !has(got, report+":title") || len(got) != 1 {
+		t.Errorf("literal %%: %v", got)
+	}
+	if got := ids("50% of"); !has(got, report+":title") {
+		t.Errorf("literal %% mid-string: %v", got)
+	}
+	// FindItems (titles only) shares the pattern rules.
+	found, err := db.FindItems(ctx, p.ID, "Write*parser")
+	if err != nil || len(found) != 1 || found[0].ID != parser {
+		t.Errorf("FindItems wildcard: %v %v", found, err)
+	}
+}

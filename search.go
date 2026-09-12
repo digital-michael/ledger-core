@@ -29,13 +29,14 @@ type SearchResult struct {
 // notes (item_id IS NULL) -- those have no item to report as the match,
 // out of scope for this pass.
 func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]SearchResult, error) {
-	like := "%" + query + "%"
-	lowerQuery := strings.ToLower(query)
+	like := likePattern(query)
 	var results []SearchResult
 
-	itemQuery := `SELECT id, title, type, status, description FROM items
-		WHERE deleted_at IS NULL AND (title LIKE ? OR description LIKE ?)`
-	itemArgs := []any{like, like}
+	// SQLite decides which field matched (title_match), rather than a Go
+	// substring test: with wildcards in the pattern the two would disagree.
+	itemQuery := `SELECT id, title, type, status, (title LIKE ? ESCAPE '\') FROM items
+		WHERE deleted_at IS NULL AND (title LIKE ? ESCAPE '\' OR description LIKE ? ESCAPE '\')`
+	itemArgs := []any{like, like, like}
 	if projectID != "" {
 		itemQuery += ` AND project_id = ?`
 		itemArgs = append(itemArgs, projectID)
@@ -48,13 +49,13 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 	}
 	for itemRows.Next() {
 		var id, title, typ, status string
-		var desc sql.NullString
-		if err := itemRows.Scan(&id, &title, &typ, &status, &desc); err != nil {
+		var titleMatch bool
+		if err := itemRows.Scan(&id, &title, &typ, &status, &titleMatch); err != nil {
 			itemRows.Close()
 			return nil, err
 		}
 		matchedIn := "description"
-		if strings.Contains(strings.ToLower(title), lowerQuery) {
+		if titleMatch {
 			matchedIn = "title"
 		}
 		results = append(results, SearchResult{ItemID: id, Title: title, Type: typ, Status: status, MatchedIn: matchedIn})
@@ -67,7 +68,7 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 
 	noteQuery := `SELECT items.id, items.title, items.type, items.status, notes.body
 		FROM notes JOIN items ON notes.item_id = items.id
-		WHERE notes.deleted_at IS NULL AND items.deleted_at IS NULL AND notes.body LIKE ?`
+		WHERE notes.deleted_at IS NULL AND items.deleted_at IS NULL AND notes.body LIKE ? ESCAPE '\'`
 	noteArgs := []any{like}
 	if projectID != "" {
 		noteQuery += ` AND items.project_id = ?`
@@ -96,4 +97,32 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 	}
 
 	return results, nil
+}
+
+// likePattern turns what a person typed into a SQL LIKE pattern.
+//
+//   - the search is "contains", so the pattern is wrapped in % either way;
+//   - '*' and '?' are the wildcards people actually type;
+//   - '%' and '_' are literal. SQLite's LIKE would treat them as wildcards,
+//     which meant a search for "50%" quietly matched everything after "50".
+//
+// Used with ESCAPE '\' by every query that searches user text.
+func likePattern(query string) string {
+	var b strings.Builder
+	b.WriteByte('%')
+	for _, r := range query {
+		switch r {
+		case '*':
+			b.WriteByte('%')
+		case '?':
+			b.WriteByte('_')
+		case '%', '_', '\\':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('%')
+	return b.String()
 }

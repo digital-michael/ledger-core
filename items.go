@@ -347,8 +347,8 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 // of items), so a LIKE scan is the only option and deliberately not backed
 // by a new dependency.
 func (db *DB) FindItems(ctx context.Context, projectID, query string) ([]Item, error) {
-	q := `SELECT ` + itemColumns + ` FROM items WHERE deleted_at IS NULL AND title LIKE ?`
-	args := []any{"%" + query + "%"}
+	q := `SELECT ` + itemColumns + ` FROM items WHERE deleted_at IS NULL AND title LIKE ? ESCAPE '\'`
+	args := []any{likePattern(query)}
 	if projectID != "" {
 		q += ` AND project_id = ?`
 		args = append(args, projectID)
