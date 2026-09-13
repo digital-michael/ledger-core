@@ -102,8 +102,10 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	}
 	if u.ExpectedUpdatedAt != "" && u.ExpectedUpdatedAt != current.updatedAt {
 		// Hand back what is there now, so the caller can show the difference
-		// rather than making the person fetch it again.
-		item, getErr := db.GetItem(ctx, id)
+		// rather than making the person fetch it again. Read it through this
+		// transaction, not a fresh connection: it is the state this check was
+		// made against, and it avoids opening a connection mid-transaction.
+		item, getErr := scanItem(tx.QueryRowContext(ctx, `SELECT `+itemColumns+` FROM items WHERE id = ?`, id))
 		if getErr != nil {
 			return nil, getErr
 		}

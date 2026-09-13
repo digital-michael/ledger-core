@@ -23,6 +23,10 @@ var (
 	// ErrConflict: someone else changed it since it was loaded. Never
 	// resolved silently -- the caller decides (docs/ledger.md U14).
 	ErrConflict = errors.New("changed since it was loaded")
+
+	// ErrDeleted: the target is soft-deleted and read-only until restored.
+	// A refusal, not a failure -- callers answer it differently.
+	ErrDeleted = errors.New("deleted")
 )
 
 // lookupError carries its own message and unwraps to its kind.

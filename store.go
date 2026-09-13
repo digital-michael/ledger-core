@@ -216,9 +216,14 @@ func open(opts Options) (*DB, error) {
 	// multi-process test dropped from 500/500 to 482/500. The update paths had
 	// always been exposed; the 2026-09-07 tests only exercised creates.
 	// Every transaction in this package writes, so immediate costs nothing.
+	// journal_mode is NOT here, deliberately: it is a persistent property of
+	// the file, so it needs setting once, not per connection -- and setting it
+	// takes an exclusive lock, which a connection opened while a write
+	// transaction is in flight cannot get. Leaving it in the DSN made every
+	// new pooled connection attempt a lock it did not need. It is applied
+	// once, below, where busy_timeout can make it wait.
 	dsn := "file:" + url.PathEscape(path) +
 		"?_pragma=busy_timeout(5000)" +
-		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=foreign_keys(ON)" +
 		"&_txlock=immediate"
 
@@ -238,15 +243,15 @@ func open(opts Options) (*DB, error) {
 		return nil, fmt.Errorf("setting db file permissions: %w", err)
 	}
 
-	// Verify the mode actually in effect rather than assuming the DSN pragma
-	// took: `PRAGMA journal_mode` reports the current mode, and a conversion
-	// that loses the exclusive-lock race reports the OLD value instead of
-	// erroring -- so a silent no-op and a success are indistinguishable
-	// without reading it back. Not fatal either way: losing the race to a
-	// peer process that already converted the file is harmless, and a working
-	// delete-mode connection beats refusing to open at all. Warn and continue.
+	// Switch to WAL once, and read back what is actually in effect rather than
+	// assuming: `PRAGMA journal_mode = WAL` returns the resulting mode, and a
+	// conversion that loses the exclusive-lock race reports the OLD value
+	// instead of erroring -- so a silent no-op and a success are
+	// indistinguishable unless the answer is read. Not fatal either way:
+	// losing the race to a peer that already converted the file is harmless,
+	// and a working delete-mode connection beats refusing to open at all.
 	var journalMode string
-	if err := conn.QueryRow(`PRAGMA journal_mode;`).Scan(&journalMode); err != nil {
+	if err := conn.QueryRow(`PRAGMA journal_mode = WAL;`).Scan(&journalMode); err != nil {
 		fmt.Fprintf(os.Stderr, "ledger: could not read journal_mode (%v)\n", err)
 	} else if !strings.EqualFold(journalMode, "wal") {
 		fmt.Fprintf(os.Stderr, "ledger: journal_mode is %q, not WAL; concurrent writes will be slower\n", journalMode)

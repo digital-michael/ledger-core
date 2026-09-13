@@ -22,7 +22,13 @@ func nowUTC() string {
 // with edits nobody saw happen (defect b1c028d7). The message names the exact
 // command that fixes it rather than failing opaquely.
 func errDeleted(entityType, id string) error {
-	return fmt.Errorf("%s %q is deleted; restore it first (ledger_restore entity_type=%s id=%s)", entityType, id, entityType, id)
+	// lookupError keeps the message exactly as it reads today (mcp-local
+	// prints it) while classifying it, so a web server can answer a refusal
+	// differently from a failure.
+	return &lookupError{
+		msg:  fmt.Sprintf("%s %q is deleted; restore it first (ledger_restore entity_type=%s id=%s)", entityType, id, entityType, id),
+		kind: ErrDeleted,
+	}
 }
 
 // refuseIfItemDeleted returns errDeleted when itemID names a soft-deleted
