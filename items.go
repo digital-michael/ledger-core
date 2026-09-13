@@ -427,6 +427,16 @@ type BulkStatusResult struct {
 // audit_log entry, exactly as if updated individually; there is no
 // bulk-specific audit shape.
 func (db *DB) BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult {
+	if err := db.permit(ctx, OpBulkUpdateStatus, Target{EntityType: "item"}); err != nil {
+		results := make([]BulkStatusResult, 0, len(ids))
+		for _, id := range ids {
+			results = append(results, BulkStatusResult{ID: id, Error: err})
+		}
+		return results
+	}
+	// One id across every row this action writes, so the audit log can show
+	// (and undo) it as the single action it was.
+	ctx = WithBatch(ctx, uuid.NewString())
 	results := make([]BulkStatusResult, 0, len(ids))
 	for _, id := range ids {
 		item, err := db.UpdateItemStatus(ctx, id, status)

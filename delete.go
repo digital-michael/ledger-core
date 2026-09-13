@@ -2,6 +2,7 @@ package ledgercore
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
 
@@ -27,6 +28,9 @@ func (db *DB) SoftDelete(ctx context.Context, entityType, id string) error {
 	table, ok := deletableTables[entityType]
 	if !ok {
 		return fmt.Errorf("unknown entity_type %q", entityType)
+	}
+	if err := db.permitDelete(ctx, entityType, id, OpDeleteProject, OpDeleteOthersNote); err != nil {
+		return err
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
@@ -60,6 +64,9 @@ func (db *DB) Restore(ctx context.Context, entityType, id string) error {
 	if !ok {
 		return fmt.Errorf("unknown entity_type %q", entityType)
 	}
+	if err := db.permitDelete(ctx, entityType, id, OpRestoreProject, OpDeleteOthersNote); err != nil {
+		return err
+	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -82,4 +89,41 @@ func (db *DB) Restore(ctx context.Context, entityType, id string) error {
 		return fmt.Errorf("writing audit log: %w", err)
 	}
 	return tx.Commit()
+}
+
+// permitDelete asks the policy about the two delete/restore cases that carry
+// weight: a project (which reaches every ticket in it) and a note somebody
+// else wrote. Deleting your own ticket or your own comment is ordinary work
+// and is not gated -- it is soft, restorable, and the UI offers undo.
+func (db *DB) permitDelete(ctx context.Context, entityType, id string, projectOp, noteOp Operation) error {
+	switch entityType {
+	case "project":
+		return db.permit(ctx, projectOp, Target{ProjectID: id, EntityType: entityType, EntityID: id})
+	case "note":
+		mine, author, err := db.noteIsMine(ctx, id)
+		if err != nil || mine {
+			return err
+		}
+		return db.permit(ctx, noteOp, Target{EntityType: entityType, EntityID: id, ProjectID: author})
+	}
+	return nil
+}
+
+// noteIsMine reports whether the current actor wrote this note. A note with
+// no recorded author (every note written before 2026-09-12) counts as mine:
+// treating history as someone else's would lock the operator out of their own
+// ledger.
+func (db *DB) noteIsMine(ctx context.Context, id string) (bool, string, error) {
+	var author sql.NullString
+	err := db.conn.QueryRowContext(ctx, `SELECT author FROM notes WHERE id = ?`, id).Scan(&author)
+	if err == sql.ErrNoRows {
+		return true, "", nil // not found: let the caller's own error handling speak
+	}
+	if err != nil {
+		return false, "", err
+	}
+	if !author.Valid || author.String == "" {
+		return true, "", nil
+	}
+	return author.String == db.currentActor(ctx).String(), author.String, nil
 }

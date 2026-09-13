@@ -77,6 +77,14 @@ type BulkRelateResult struct {
 // constraint) doesn't block the rest. Each success gets its own real
 // audit_log entry, exactly as if related individually via RelateItems.
 func (db *DB) BulkRelateItems(ctx context.Context, fromIDs []string, toID, relationType string) []BulkRelateResult {
+	if err := db.permit(ctx, OpBulkRelate, Target{EntityType: "item_relation"}); err != nil {
+		results := make([]BulkRelateResult, 0, len(fromIDs))
+		for _, id := range fromIDs {
+			results = append(results, BulkRelateResult{FromID: id, Error: err})
+		}
+		return results
+	}
+	ctx = WithBatch(ctx, uuid.NewString())
 	results := make([]BulkRelateResult, 0, len(fromIDs))
 	for _, fromID := range fromIDs {
 		rel, err := db.RelateItems(ctx, fromID, toID, relationType)

@@ -93,13 +93,17 @@ type Options struct {
 	// Path is the SQLite file to open. Empty means DefaultPath().
 	Path string
 
-	// Client names whoever is performing a mutation, for audit_log.client.
-	// It is called once per audit row, with the context of the call that
-	// caused it -- so a caller whose identity lives in the request context
-	// (mcp-local reads the MCP session's negotiated ClientInfo.Name from it)
-	// can resolve it per request, while a caller with a fixed identity can
-	// return a constant. nil, or a function returning "", records NULL.
-	Client func(context.Context) string
+	// Actor names whoever is performing a mutation. It is called once per
+	// audit row, with the context of the call that caused it -- so a caller
+	// whose identity lives in the request context (mcp-local reads the MCP
+	// session's negotiated ClientInfo.Name from it) resolves it per request,
+	// while a caller with a fixed identity returns a constant. nil, or an
+	// Actor with no ID, records NULL rather than a guess.
+	Actor func(context.Context) Actor
+
+	// Permit can refuse a privileged operation -- see policy.go. nil allows
+	// everything, which is a single operator's ledger as it stands today.
+	Permit func(context.Context, Actor, Operation, Target) error
 }
 
 // SQLiteFactory creates SQLite-backed Store instances using Options.
@@ -115,7 +119,8 @@ func (f SQLiteFactory) Open() (Store, error) {
 // DB wraps a SQLite connection. It implements Store.
 type DB struct {
 	conn   *sql.DB
-	client func(context.Context) string
+	actor  func(context.Context) Actor
+	policy func(context.Context, Actor, Operation, Target) error
 }
 
 // DefaultPath resolves the ledger SQLite file location.
@@ -273,6 +278,20 @@ func open(opts Options) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
+	// Who did it, and whether it was part of one bulk action. Added
+	// 2026-09-12; existing rows keep NULL, because an old row genuinely does
+	// not know its actor and inventing one would be worse than an honest gap.
+	for _, c := range []struct{ table, column string }{
+		{"audit_log", "actor"},
+		{"audit_log", "batch"},
+		{"notes", "author"},
+		{"notes", "author_label"},
+	} {
+		if err := ensureColumn(conn, c.table, c.column, "TEXT"); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
 	// component_id (a foreign key) was replaced by component (a plain
 	// denormalized string) before any external release existed to depend on
 	// the old shape -- see docs/ledger.md. A database that already ran the
@@ -308,7 +327,7 @@ func open(opts Options) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{conn: conn, client: opts.Client}, nil
+	return &DB{conn: conn, actor: opts.Actor, policy: opts.Permit}, nil
 }
 
 // ensureColumn adds column to table if it doesn't already exist. SQLite's

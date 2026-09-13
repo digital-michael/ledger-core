@@ -22,8 +22,12 @@ type Note struct {
 	Type      string
 	Body      sql.NullString
 	URL       sql.NullString
-	CreatedAt string
-	UpdatedAt string
+	// Who wrote it. NULL on every note written before 2026-09-12, when the
+	// only trace of authorship was the audit row's program name.
+	Author      sql.NullString // canonical "kind:id"
+	AuthorLabel sql.NullString // what a person reads
+	CreatedAt   string
+	UpdatedAt   string
 }
 
 // AddNoteParams are the inputs to inserting a note. Type defaults to
@@ -87,10 +91,12 @@ func (db *DB) insertNote(ctx context.Context, tx *sql.Tx, p AddNoteParams) (*Not
 	}
 	id := uuid.NewString()
 	now := nowUTC()
+	author := db.currentActor(ctx)
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO notes (id, project_id, item_id, type, body, url, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, nullIfEmpty(p.ProjectID), nullIfEmpty(p.ItemID), p.Type, nullIfEmpty(p.Body), nullIfEmpty(p.URL), now, now,
+		`INSERT INTO notes (id, project_id, item_id, type, body, url, author, author_label, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, nullIfEmpty(p.ProjectID), nullIfEmpty(p.ItemID), p.Type, nullIfEmpty(p.Body), nullIfEmpty(p.URL),
+		nullIfEmpty(author.String()), nullIfEmpty(author.DisplayName()), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting note: %w", err)
@@ -112,14 +118,16 @@ func (db *DB) insertNote(ctx context.Context, tx *sql.Tx, p AddNoteParams) (*Not
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
 	return &Note{
-		ID:        id,
-		ProjectID: sql.NullString{String: p.ProjectID, Valid: p.ProjectID != ""},
-		ItemID:    sql.NullString{String: p.ItemID, Valid: p.ItemID != ""},
-		Type:      p.Type,
-		Body:      sql.NullString{String: p.Body, Valid: p.Body != ""},
-		URL:       sql.NullString{String: p.URL, Valid: p.URL != ""},
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          id,
+		ProjectID:   sql.NullString{String: p.ProjectID, Valid: p.ProjectID != ""},
+		ItemID:      sql.NullString{String: p.ItemID, Valid: p.ItemID != ""},
+		Type:        p.Type,
+		Body:        sql.NullString{String: p.Body, Valid: p.Body != ""},
+		URL:         sql.NullString{String: p.URL, Valid: p.URL != ""},
+		Author:      sql.NullString{String: author.String(), Valid: author.String() != ""},
+		AuthorLabel: sql.NullString{String: author.DisplayName(), Valid: author.DisplayName() != ""},
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}, nil
 }
 
@@ -132,11 +140,11 @@ func (db *DB) ListNotes(ctx context.Context, itemID, projectID string) ([]Note, 
 	switch {
 	case itemID != "":
 		rows, err = db.conn.QueryContext(ctx,
-			`SELECT id, project_id, item_id, type, body, url, created_at, updated_at
+			`SELECT id, project_id, item_id, type, body, url, author, author_label, created_at, updated_at
 			 FROM notes WHERE item_id = ? AND deleted_at IS NULL ORDER BY created_at`, itemID)
 	case projectID != "":
 		rows, err = db.conn.QueryContext(ctx,
-			`SELECT id, project_id, item_id, type, body, url, created_at, updated_at
+			`SELECT id, project_id, item_id, type, body, url, author, author_label, created_at, updated_at
 			 FROM notes WHERE project_id = ? AND item_id IS NULL AND deleted_at IS NULL ORDER BY created_at`, projectID)
 	default:
 		return nil, errors.New("ledger_list_notes requires an item id or a project id")
@@ -149,7 +157,7 @@ func (db *DB) ListNotes(ctx context.Context, itemID, projectID string) ([]Note, 
 	var notes []Note
 	for rows.Next() {
 		var n Note
-		if err := rows.Scan(&n.ID, &n.ProjectID, &n.ItemID, &n.Type, &n.Body, &n.URL, &n.CreatedAt, &n.UpdatedAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.ProjectID, &n.ItemID, &n.Type, &n.Body, &n.URL, &n.Author, &n.AuthorLabel, &n.CreatedAt, &n.UpdatedAt); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -324,8 +332,8 @@ func (db *DB) UpdateNote(ctx context.Context, id string, p UpdateNoteParams) (*N
 func getNote(ctx context.Context, tx *sql.Tx, id string) (*Note, error) {
 	var n Note
 	err := tx.QueryRowContext(ctx,
-		`SELECT id, project_id, item_id, type, body, url, created_at, updated_at FROM notes WHERE id = ?`, id).
-		Scan(&n.ID, &n.ProjectID, &n.ItemID, &n.Type, &n.Body, &n.URL, &n.CreatedAt, &n.UpdatedAt)
+		`SELECT id, project_id, item_id, type, body, url, author, author_label, created_at, updated_at FROM notes WHERE id = ?`, id).
+		Scan(&n.ID, &n.ProjectID, &n.ItemID, &n.Type, &n.Body, &n.URL, &n.Author, &n.AuthorLabel, &n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("reading note %q: %w", id, err)
 	}

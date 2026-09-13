@@ -41,7 +41,7 @@ func ptr(s string) *string { return &s }
 
 func openAt(t *testing.T, path string) *DB {
 	t.Helper()
-	s, err := Open(Options{Path: path, Client: func(context.Context) string { return testClient }})
+	s, err := Open(Options{Path: path, Actor: func(context.Context) Actor { return Actor{Kind: ActorProgram, ID: testClient, Label: testClient} }})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -75,7 +75,7 @@ func mustItem(t *testing.T, db *DB, projectID, title string) *Item {
 // auditRows returns every audit row for one entity, oldest first.
 func auditRows(t *testing.T, db *DB, entityType, id string) []AuditEntry {
 	t.Helper()
-	rows, err := db.conn.Query(`SELECT id, entity_type, entity_id, operation, detail, created_at, client
+	rows, err := db.conn.Query(`SELECT id, entity_type, entity_id, operation, detail, created_at, client, actor, batch
 		FROM audit_log WHERE entity_type = ? AND entity_id = ? ORDER BY rowid`, entityType, id)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func auditRows(t *testing.T, db *DB, entityType, id string) []AuditEntry {
 	var out []AuditEntry
 	for rows.Next() {
 		var e AuditEntry
-		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Operation, &e.Detail, &e.CreatedAt, &e.Client); err != nil {
+		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Operation, &e.Detail, &e.CreatedAt, &e.Client, &e.Actor, &e.Batch); err != nil {
 			t.Fatal(err)
 		}
 		out = append(out, e)
@@ -700,7 +700,9 @@ func runWriter() int {
 	worker := os.Getenv("LEDGERCORE_WRITER")
 	path, project := os.Getenv("LEDGERCORE_PATH"), os.Getenv("LEDGERCORE_PROJECT")
 	n, _ := strconv.Atoi(os.Getenv("LEDGERCORE_N"))
-	opts := Options{Path: path, Client: func(context.Context) string { return "writer/" + worker }}
+	opts := Options{Path: path, Actor: func(context.Context) Actor {
+		return Actor{Kind: ActorProgram, ID: "writer/" + worker, Label: "writer/" + worker}
+	}}
 
 	failures := 0
 	for i := 0; i < n; i++ {
@@ -1121,5 +1123,198 @@ func TestHealthFindings(t *testing.T) {
 		if len(got[check]) != 0 {
 			t.Errorf("%s still reported after it was fixed: %+v", check, got[check])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Who did it, as one action, and what may be refused (2026-09-12)
+// ---------------------------------------------------------------------------
+
+func openAs(t *testing.T, path string, actor Actor, permit func(context.Context, Actor, Operation, Target) error) *DB {
+	t.Helper()
+	s, err := Open(Options{
+		Path:   path,
+		Actor:  func(context.Context) Actor { return actor },
+		Permit: permit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s.(*DB)
+}
+
+func TestActorAndAuthorRecorded(t *testing.T) {
+	person := Actor{Kind: ActorPerson, ID: "u-1", Label: "Michael"}
+	db := openAs(t, filepath.Join(t.TempDir(), "l.db"), person, nil)
+	p := mustProject(t, db, "actors")
+	it := mustItem(t, db, p.ID, "a ticket")
+
+	// Every audit row carries both forms: the label a person reads, and the
+	// canonical id a future account system can resolve.
+	for _, e := range auditRows(t, db, "item", it.ID) {
+		if e.Client.String != "Michael" || e.Actor.String != "person:u-1" {
+			t.Errorf("audit row: client=%q actor=%q", e.Client.String, e.Actor.String)
+		}
+		if e.Batch.Valid {
+			t.Errorf("a single edit should not be part of a batch: %q", e.Batch.String)
+		}
+	}
+
+	// A comment records its author, which is what "who wrote this" needs.
+	note, err := db.AddNote(ctx, AddNoteParams{ItemID: it.ID, Body: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if note.Author.String != "person:u-1" || note.AuthorLabel.String != "Michael" {
+		t.Errorf("note author: %q / %q", note.Author.String, note.AuthorLabel.String)
+	}
+	notes, _ := db.ListNotes(ctx, it.ID, "")
+	if len(notes) != 1 || notes[0].Author.String != "person:u-1" {
+		t.Errorf("author not read back: %+v", notes)
+	}
+
+	// No resolver: NULL, not a guess.
+	anon := openAs(t, filepath.Join(t.TempDir(), "anon.db"), Actor{}, nil)
+	ap := mustProject(t, anon, "anon")
+	for _, e := range auditRows(t, anon, "project", ap.ID) {
+		if e.Actor.Valid || e.Client.Valid {
+			t.Errorf("unknown actor recorded as %q/%q", e.Client.String, e.Actor.String)
+		}
+	}
+}
+
+// A bulk change was N unrelated audit rows until now. One batch id makes it
+// one event with N parts -- which is what makes it reportable and undoable.
+func TestBulkChangeIsOneAuditableAction(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "bulk")
+	a, b, c := mustItem(t, db, p.ID, "a"), mustItem(t, db, p.ID, "b"), mustItem(t, db, p.ID, "c")
+
+	results := db.BulkUpdateItemStatus(ctx, []string{a.ID, b.ID, c.ID, "no-such-item"}, "done")
+	if len(results) != 4 || results[3].Error == nil {
+		t.Fatalf("expected three successes and one failure: %+v", results)
+	}
+
+	batches := map[string]int{}
+	for _, id := range []string{a.ID, b.ID, c.ID} {
+		rows := auditRows(t, db, "item", id)
+		last := rows[len(rows)-1]
+		if last.Operation != "status_changed" || !last.Batch.Valid {
+			t.Fatalf("%s: operation=%s batch=%v", id, last.Operation, last.Batch)
+		}
+		batches[last.Batch.String]++
+	}
+	if len(batches) != 1 {
+		t.Errorf("the three changes should share one batch id, got %v", batches)
+	}
+
+	// A single edit afterwards is not part of that batch.
+	db.UpdateItemStatus(ctx, a.ID, "planned")
+	rows := auditRows(t, db, "item", a.ID)
+	if rows[len(rows)-1].Batch.Valid {
+		t.Error("a single edit was tagged with a batch id")
+	}
+}
+
+func TestPrivilegedOperationsPassThroughPolicy(t *testing.T) {
+	var asked []Operation
+	refuse := errors.New("not allowed here")
+	deny := func(_ context.Context, _ Actor, op Operation, target Target) error {
+		asked = append(asked, op)
+		if op == OpDeleteProject || op == OpBulkUpdateStatus {
+			return refuse
+		}
+		if op == OpDeleteProject && target.ProjectID == "" {
+			t.Error("a project operation must name its project, for per-project access later")
+		}
+		return nil
+	}
+	db := openAs(t, filepath.Join(t.TempDir(), "l.db"), Actor{Kind: ActorPerson, ID: "u-1"}, deny)
+	p := mustProject(t, db, "policy")
+	it := mustItem(t, db, p.ID, "a ticket")
+
+	// Refused, and nothing happened.
+	if err := db.SoftDelete(ctx, "project", p.ID); !errors.Is(err, refuse) {
+		t.Errorf("deleting a project: %v", err)
+	}
+	if projects, _ := db.ListProjects(ctx); len(projects) != 1 {
+		t.Error("the project was deleted despite the refusal")
+	}
+	for _, r := range db.BulkUpdateItemStatus(ctx, []string{it.ID}, "done") {
+		if !errors.Is(r.Error, refuse) {
+			t.Errorf("bulk: %v", r.Error)
+		}
+	}
+	if got, _ := db.GetItem(ctx, it.ID); got.Status != "backlog" {
+		t.Errorf("bulk change applied despite the refusal: %s", got.Status)
+	}
+
+	// Ordinary work is not gated at all.
+	if _, err := db.UpdateItemStatus(ctx, it.ID, "planned"); err != nil {
+		t.Errorf("an ordinary status change was refused: %v", err)
+	}
+	if err := db.SoftDelete(ctx, "item", it.ID); err != nil {
+		t.Errorf("deleting one's own ticket was refused: %v", err)
+	}
+	for _, op := range asked {
+		if op != OpDeleteProject && op != OpBulkUpdateStatus {
+			t.Errorf("policy asked about an operation that should be ordinary: %s", op)
+		}
+	}
+}
+
+// Editing or deleting someone else's comment is privileged; your own is not.
+// A comment with no recorded author (everything written before 2026-09-12)
+// counts as yours, so history doesn't lock the operator out.
+func TestOthersCommentsArePrivileged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "l.db")
+	alice := Actor{Kind: ActorPerson, ID: "alice"}
+	bob := Actor{Kind: ActorPerson, ID: "bob"}
+
+	var asked []Operation
+	record := func(_ context.Context, _ Actor, op Operation, _ Target) error {
+		asked = append(asked, op)
+		return nil
+	}
+
+	dbA := openAs(t, path, alice, record)
+	p := mustProject(t, dbA, "comments")
+	it := mustItem(t, dbA, p.ID, "a ticket")
+	hers, err := dbA.AddNote(ctx, AddNoteParams{ItemID: it.ID, Body: "alice wrote this"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A pre-authorship note: author NULL, as every existing note is.
+	legacy, _ := dbA.AddNote(ctx, AddNoteParams{ItemID: it.ID, Body: "from before"})
+	if _, err := dbA.conn.Exec(`UPDATE notes SET author = NULL, author_label = NULL WHERE id = ?`, legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice deleting her own note asks nothing.
+	asked = nil
+	if err := dbA.SoftDelete(ctx, "note", hers.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 0 {
+		t.Errorf("deleting one's own comment was gated: %v", asked)
+	}
+	// Nor does anyone deleting an unattributed one.
+	if err := dbA.SoftDelete(ctx, "note", legacy.ID); err != nil || len(asked) != 0 {
+		t.Errorf("an unattributed comment was gated: %v %v", err, asked)
+	}
+
+	// Bob deleting Alice's note does go through the policy.
+	dbB := openAs(t, path, bob, record)
+	other, err := dbB.AddNote(ctx, AddNoteParams{ItemID: it.ID, Body: "bob wrote this"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asked = nil
+	if err := dbA.SoftDelete(ctx, "note", other.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0] != OpDeleteOthersNote {
+		t.Errorf("deleting another actor's comment should be privileged, asked: %v", asked)
 	}
 }

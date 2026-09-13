@@ -18,24 +18,32 @@ type AuditEntry struct {
 	Operation  string
 	Detail     sql.NullString
 	CreatedAt  string
-	Client     sql.NullString
+	Client     sql.NullString // readable label, e.g. "claude-code"
+	Actor      sql.NullString // canonical "kind:id"; NULL before 2026-09-12
+	Batch      sql.NullString // set when this row was part of one bulk action
 }
 
 // insertAudit writes one audit_log row as part of tx. Every mutating
 // function in this package calls this inside its own transaction, so the
 // audit row and the change it describes commit or roll back together.
 //
-// client comes from Options.Client, resolved against ctx here, once, rather
-// than threading a "who called this" string through every mutating
+// The actor comes from Options.Actor, resolved against ctx here, once,
+// rather than threading a "who called this" value through every mutating
 // function's signature. This package used to read it straight out of an
 // mcp-go session in ctx, which tied the storage layer to one caller's
-// transport; the caller now supplies the resolver (see Options.Client).
+// transport; the caller now supplies the resolver.
+//
+// Two columns, deliberately: client holds the readable label (what the
+// existing rows and every reader already expect), actor holds the canonical
+// "kind:id" that a future account system can resolve. batch ties the rows of
+// one bulk action together.
 func (db *DB) insertAudit(ctx context.Context, tx *sql.Tx, entityType, entityID, operation, detail string) error {
+	actor := db.currentActor(ctx)
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO audit_log (id, entity_type, entity_id, operation, detail, created_at, client)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO audit_log (id, entity_type, entity_id, operation, detail, created_at, client, actor, batch)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		uuid.NewString(), entityType, nullIfEmpty(entityID), operation, nullIfEmpty(detail), nowUTC(),
-		nullIfEmpty(db.clientName(ctx)),
+		nullIfEmpty(actor.DisplayName()), nullIfEmpty(actor.String()), nullIfEmpty(batchFromContext(ctx)),
 	)
 	return err
 }
@@ -49,14 +57,8 @@ func startOfTodayUTC() string {
 	return start.Format(time.RFC3339Nano)
 }
 
-// clientName returns whoever the caller says is performing this mutation,
-// or "" (stored as NULL) if the caller supplied no resolver.
-func (db *DB) clientName(ctx context.Context) string {
-	if db.client == nil {
-		return ""
-	}
-	return db.client(ctx)
-}
+// AuditEntry.Actor and .Batch expose the two columns added 2026-09-12; both
+// are NULL on rows written before then.
 
 // AuditFilter narrows ListAuditLog. Zero-value fields mean "no filter" on
 // that column. Since/Today/Hours are three alternate ways to express the
@@ -74,7 +76,7 @@ type AuditFilter struct {
 
 // ListAuditLog returns matching audit_log rows ordered by created_at.
 func (db *DB) ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, error) {
-	q := `SELECT id, entity_type, entity_id, operation, detail, created_at, client FROM audit_log WHERE 1=1`
+	q := `SELECT id, entity_type, entity_id, operation, detail, created_at, client, actor, batch FROM audit_log WHERE 1=1`
 	var args []any
 	if f.EntityType != "" {
 		q += ` AND entity_type = ?`
@@ -111,7 +113,7 @@ func (db *DB) ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, er
 	var entries []AuditEntry
 	for rows.Next() {
 		var e AuditEntry
-		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Operation, &e.Detail, &e.CreatedAt, &e.Client); err != nil {
+		if err := rows.Scan(&e.ID, &e.EntityType, &e.EntityID, &e.Operation, &e.Detail, &e.CreatedAt, &e.Client, &e.Actor, &e.Batch); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
