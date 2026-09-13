@@ -46,6 +46,10 @@ type Store interface {
 	ListItems(ctx context.Context, f ItemFilter) ([]Item, error)
 	FindItems(ctx context.Context, projectID, query string) ([]Item, error)
 	SearchItems(ctx context.Context, projectID, query string) ([]SearchResult, error)
+	// UpdateItemFields is where an item edit happens: every editable field,
+	// one transaction, optional conflict check. The four below are wrappers
+	// kept for the callers that already use them.
+	UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*Item, error)
 	UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error)
 	UpdateItemStatus(ctx context.Context, id, status string) (*Item, error)
 	BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult

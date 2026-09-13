@@ -1,7 +1,5 @@
 package ledgercore
 
-import "strings"
-
 // Vocabulary is the closed set of values the ledger accepts for each of its
 // enumerated columns. It is the single source for three things that must
 // never disagree:
@@ -62,17 +60,15 @@ var (
 	noteTypes = []string{NoteTypeComment, NoteTypeTimeStarted, NoteTypeTimeEnded}
 )
 
-// Derived lookup sets and error-message lists. Derived, never hand-written,
-// so they cannot drift from the ordered sets above.
+// Derived lookup sets. Derived, never hand-written, so they cannot drift from
+// the ordered sets above. The "must be one of ..." wording that used to live
+// here is now built by FieldError from the same slices.
 var (
 	validItemTypes     = setOf(itemTypes)
 	validStatuses      = setOf(statuses)
 	validRelationTypes = setOf(relationTypes)
 	validNoteTypes     = setOf(noteTypes)
 
-	validItemTypesDesc     = strings.Join(itemTypes, ", ")
-	validStatusesDesc      = strings.Join(statuses, ", ")
-	validRelationTypesDesc = strings.Join(relationTypes, ", ")
 )
 
 // Vocab returns the ledger's vocabulary. Each call returns fresh slices, so

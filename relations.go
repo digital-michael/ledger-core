@@ -24,7 +24,7 @@ type ItemRelation struct {
 // relationType outside validRelationTypes.
 func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string) (*ItemRelation, error) {
 	if !validRelationTypes[relationType] {
-		return nil, fmt.Errorf("invalid relation_type %q: must be one of %s", relationType, validRelationTypesDesc)
+		return nil, &FieldError{Field: "relation_type", Value: relationType, Allowed: relationTypes}
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)

@@ -1318,3 +1318,177 @@ func TestOthersCommentsArePrivileged(t *testing.T) {
 		t.Errorf("deleting another actor's comment should be privileged, asked: %v", asked)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// One edit, several fields, and a conflict check (2026-09-12)
+// ---------------------------------------------------------------------------
+
+func TestUpdateItemFields(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "edit")
+	it, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "before", Description: "desc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A save touching three kinds of field: one call, one transaction.
+	three := int64(3)
+	got, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{
+		Title: ptr("after"), Status: ptr("in_progress"), Priority: &three, Assignee: ptr("michael"),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "after" || got.Status != "in_progress" || got.Priority.Int64 != 3 ||
+		got.Assignee.String != "michael" || got.Description.String != "desc" {
+		t.Errorf("after the save: %+v", got)
+	}
+
+	// History stays fine-grained -- a retitle is not the same fact as a
+	// status change -- but the rows are tied together as one act.
+	rows := auditRows(t, db, "item", it.ID)
+	ops := map[string]string{}
+	batches := map[string]bool{}
+	for _, r := range rows[1:] { // skip "created"
+		ops[r.Operation] = r.Detail.String
+		batches[r.Batch.String] = true
+	}
+	for _, want := range []string{"updated", "status_changed", "priority_changed", "assigned"} {
+		if ops[want] == "" {
+			t.Errorf("no %s row: %v", want, ops)
+		}
+	}
+	if !strings.Contains(ops["updated"], `"title":["before","after"]`) {
+		t.Errorf("field detail: %s", ops["updated"])
+	}
+	if !strings.Contains(ops["priority_changed"], `"from":"(none)"`) {
+		t.Errorf("priority detail should say the old value was none: %s", ops["priority_changed"])
+	}
+	if len(batches) != 1 || batches[""] {
+		t.Errorf("the four rows should share one batch id, got %v", batches)
+	}
+
+	// Nothing given that differs: no write, no audit row.
+	before := len(auditRows(t, db, "item", it.ID))
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Title: ptr("after")}}); err != nil {
+		t.Fatal(err)
+	}
+	if after := len(auditRows(t, db, "item", it.ID)); after != before {
+		t.Errorf("an unchanged save wrote %d row(s)", after-before)
+	}
+
+	_, err = db.UpdateItemFields(ctx, it.ID, ItemUpdate{})
+	wantErrContaining(t, err, "no fields given")
+
+	// Typed field errors, so a caller can put the message next to the input.
+	_, err = db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Status: ptr("doing")}})
+	var fe *FieldError
+	if !errors.As(err, &fe) || fe.Field != "status" || fe.Value != "doing" || len(fe.Allowed) != 5 {
+		t.Errorf("status field error: %v (%+v)", err, fe)
+	}
+	// ...with the wording unchanged, because mcp-local prints it.
+	if err.Error() != `invalid status "doing": must be one of backlog, planned, in_progress, blocked, done` {
+		t.Errorf("message changed: %q", err.Error())
+	}
+	if !errors.Is(err, ErrInvalidField) {
+		t.Error("a field error should match ErrInvalidField")
+	}
+}
+
+// The case that matters here: the operator edits a ticket a Claude session
+// changes mid-edit.
+func TestEditConflict(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "conflict")
+	it := mustItem(t, db, p.ID, "shared")
+	loaded := it.UpdatedAt
+
+	// Something else moves it along.
+	if _, err := db.UpdateItemStatus(ctx, it.ID, "in_progress"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The stale save is refused, and the current item comes back with the
+	// error so the caller can show what happened without reading again.
+	current, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{
+		Fields:            ItemFields{Title: ptr("my edit")},
+		ExpectedUpdatedAt: loaded,
+	})
+	var ce *ConflictError
+	if !errors.As(err, &ce) || !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+	if ce.Expected != loaded || ce.Actual == loaded {
+		t.Errorf("conflict timestamps: %+v", ce)
+	}
+	if current == nil || current.Status != "in_progress" || current.Title != "shared" {
+		t.Errorf("the current item should come back with the conflict: %+v", current)
+	}
+
+	// Nothing was written.
+	if got, _ := db.GetItem(ctx, it.ID); got.Title != "shared" {
+		t.Errorf("the refused edit was applied: %q", got.Title)
+	}
+
+	// Saving against the current version works.
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{
+		Fields:            ItemFields{Title: ptr("my edit")},
+		ExpectedUpdatedAt: current.UpdatedAt,
+	}); err != nil {
+		t.Errorf("saving against the current version: %v", err)
+	}
+
+	// No expectation given means write regardless -- what the MCP tools do.
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Title: ptr("tool edit")}}); err != nil {
+		t.Errorf("unconditional save: %v", err)
+	}
+}
+
+// Changing what a ticket *is* passes the policy; ordinary field edits don't.
+func TestTypeChangeIsPrivileged(t *testing.T) {
+	refuse := errors.New("admins only")
+	var asked []Operation
+	db := openAs(t, filepath.Join(t.TempDir(), "l.db"), Actor{Kind: ActorPerson, ID: "u"},
+		func(_ context.Context, _ Actor, op Operation, target Target) error {
+			asked = append(asked, op)
+			if target.ProjectID == "" {
+				t.Error("a type change must name its project, for per-project access later")
+			}
+			return refuse
+		})
+	p := mustProject(t, db, "types")
+	it := mustItem(t, db, p.ID, "a task")
+
+	_, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Type: ptr("defect")}})
+	if !errors.Is(err, refuse) {
+		t.Errorf("type change should have been refused: %v", err)
+	}
+	if got, _ := db.GetItem(ctx, it.ID); got.Type != "task" {
+		t.Errorf("type changed despite the refusal: %s", got.Type)
+	}
+	if len(asked) != 1 || asked[0] != OpChangeItemType {
+		t.Errorf("policy asked: %v", asked)
+	}
+
+	// An ordinary edit is not gated, even in the same call shape.
+	asked = nil
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Title: ptr("retitled")}}); err != nil {
+		t.Errorf("ordinary edit refused: %v", err)
+	}
+	if len(asked) != 0 {
+		t.Errorf("ordinary edit went through the policy: %v", asked)
+	}
+
+	// Allowed: it applies, and history records it as its own kind of change.
+	allow := openAs(t, filepath.Join(t.TempDir(), "allow.db"), Actor{Kind: ActorPerson, ID: "u"}, nil)
+	ap := mustProject(t, allow, "types")
+	ait := mustItem(t, allow, ap.ID, "a task")
+	if _, err := allow.UpdateItemFields(ctx, ait.ID, ItemUpdate{Fields: ItemFields{Type: ptr("defect")}}); err != nil {
+		t.Fatal(err)
+	}
+	rows := auditRows(t, allow, "item", ait.ID)
+	last := rows[len(rows)-1]
+	if last.Operation != "type_changed" || !strings.Contains(last.Detail.String, `"to":"defect"`) {
+		t.Errorf("type change history: %s %s", last.Operation, last.Detail.String)
+	}
+}

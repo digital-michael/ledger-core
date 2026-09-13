@@ -133,13 +133,13 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 		p.Type = "task"
 	}
 	if !validItemTypes[p.Type] {
-		return nil, fmt.Errorf("invalid type %q: must be one of %s", p.Type, validItemTypesDesc)
+		return nil, &FieldError{Field: "type", Value: p.Type, Allowed: itemTypes}
 	}
 	if p.Status == "" {
 		p.Status = "backlog"
 	}
 	if !validStatuses[p.Status] {
-		return nil, fmt.Errorf("invalid status %q: must be one of %s", p.Status, validStatusesDesc)
+		return nil, &FieldError{Field: "status", Value: p.Status, Allowed: statuses}
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
@@ -372,47 +372,9 @@ func (db *DB) FindItems(ctx context.Context, projectID, query string) ([]Item, e
 	return items, rows.Err()
 }
 
-// UpdateItemStatus changes an item's status and records the before/after
-// values in audit_log, in the same transaction as the update.
+// UpdateItemStatus moves an item along. A wrapper over UpdateItemFields.
 func (db *DB) UpdateItemStatus(ctx context.Context, id, status string) (*Item, error) {
-	if !validStatuses[status] {
-		return nil, fmt.Errorf("invalid status %q: must be one of %s", status, validStatusesDesc)
-	}
-
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var oldStatus string
-	var deletedAt sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT status, deleted_at FROM items WHERE id = ?`, id).Scan(&oldStatus, &deletedAt)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("item %q not found", id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("looking up item %q: %w", id, err)
-	}
-	if deletedAt.Valid {
-		return nil, errDeleted("item", id)
-	}
-
-	now := nowUTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE items SET status = ?, updated_at = ? WHERE id = ?`, status, now, id); err != nil {
-		return nil, fmt.Errorf("updating status: %w", err)
-	}
-
-	detail, _ := json.Marshal(map[string]string{"from": oldStatus, "to": status})
-	if err := db.insertAudit(ctx, tx, "item", id, "status_changed", string(detail)); err != nil {
-		return nil, fmt.Errorf("writing audit log: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return db.GetItem(ctx, id)
+	return db.UpdateItemFields(ctx, id, ItemUpdate{Fields: ItemFields{Status: &status}})
 }
 
 // BulkStatusResult is one id's outcome from BulkUpdateItemStatus.
@@ -445,47 +407,10 @@ func (db *DB) BulkUpdateItemStatus(ctx context.Context, ids []string, status str
 	return results
 }
 
-// UpdateItemPriority changes an item's priority and records the before/after
-// values in audit_log, in the same transaction as the update.
+// UpdateItemPriority sets an item's priority. A wrapper over UpdateItemFields.
 func (db *DB) UpdateItemPriority(ctx context.Context, id string, priority int) (*Item, error) {
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var oldPriority sql.NullInt64
-	var deletedAt sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT priority, deleted_at FROM items WHERE id = ?`, id).Scan(&oldPriority, &deletedAt)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("item %q not found", id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("looking up item %q: %w", id, err)
-	}
-	if deletedAt.Valid {
-		return nil, errDeleted("item", id)
-	}
-
-	now := nowUTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE items SET priority = ?, updated_at = ? WHERE id = ?`, priority, now, id); err != nil {
-		return nil, fmt.Errorf("updating priority: %w", err)
-	}
-
-	oldVal := "(none)"
-	if oldPriority.Valid {
-		oldVal = fmt.Sprintf("%d", oldPriority.Int64)
-	}
-	detail, _ := json.Marshal(map[string]string{"from": oldVal, "to": fmt.Sprintf("%d", priority)})
-	if err := db.insertAudit(ctx, tx, "item", id, "priority_changed", string(detail)); err != nil {
-		return nil, fmt.Errorf("writing audit log: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return db.GetItem(ctx, id)
+	p := int64(priority)
+	return db.UpdateItemFields(ctx, id, ItemUpdate{Fields: ItemFields{Priority: &p}})
 }
 
 // UpdateItemParams is UpdateItem's per-field patch: nil means "leave this
@@ -502,132 +427,20 @@ type UpdateItemParams struct {
 	Component   *string
 }
 
-// UpdateItem patches an item's title/description/label/component —
-// whichever fields are non-nil in p — and records exactly what changed
-// (old/new per field) in a single "updated" audit_log entry. A field whose
-// new value equals its current value is not recorded as a change and does
-// not appear in the UPDATE at all.
+// UpdateItem edits an item's title, description, label and/or component.
+// A wrapper over UpdateItemFields, which is where an item edit actually
+// happens; this keeps the shape the MCP tools already call.
 func (db *DB) UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error) {
 	if p.Title == nil && p.Description == nil && p.Label == nil && p.Component == nil {
 		return nil, errors.New("at least one of title, description, label, or component must be given")
 	}
-
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var projectID, itemType, oldTitle string
-	var oldDescription, oldLabel, oldComponent, deletedAt sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component, deleted_at FROM items WHERE id = ?`, id).
-		Scan(&projectID, &itemType, &oldTitle, &oldDescription, &oldLabel, &oldComponent, &deletedAt)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("item %q not found", id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("looking up item %q: %w", id, err)
-	}
-	if deletedAt.Valid {
-		return nil, errDeleted("item", id)
-	}
-
-	changes := map[string][2]string{}
-	var setClauses []string
-	var args []any
-
-	if p.Title != nil && *p.Title != oldTitle {
-		if itemType == "component" {
-			if err := validateComponentTitleUnique(ctx, tx, projectID, *p.Title, id); err != nil {
-				return nil, err
-			}
-		}
-		changes["title"] = [2]string{oldTitle, *p.Title}
-		setClauses = append(setClauses, "title = ?")
-		args = append(args, *p.Title)
-	}
-	if p.Description != nil && *p.Description != oldDescription.String {
-		changes["description"] = [2]string{oldDescription.String, *p.Description}
-		setClauses = append(setClauses, "description = ?")
-		args = append(args, nullIfEmpty(*p.Description))
-	}
-	if p.Label != nil && *p.Label != oldLabel.String {
-		changes["label"] = [2]string{oldLabel.String, *p.Label}
-		setClauses = append(setClauses, "label = ?")
-		args = append(args, nullIfEmpty(*p.Label))
-	}
-	if p.Component != nil && *p.Component != oldComponent.String {
-		if *p.Component != "" {
-			if err := validateComponentTitle(ctx, tx, *p.Component); err != nil {
-				return nil, err
-			}
-		}
-		changes["component"] = [2]string{oldComponent.String, *p.Component}
-		setClauses = append(setClauses, "component = ?")
-		args = append(args, nullIfEmpty(*p.Component))
-	}
-
-	if len(setClauses) == 0 {
-		return db.GetItem(ctx, id)
-	}
-
-	now := nowUTC()
-	setClauses = append(setClauses, "updated_at = ?")
-	args = append(args, now, id)
-	q := "UPDATE items SET " + strings.Join(setClauses, ", ") + " WHERE id = ?"
-	if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-		return nil, fmt.Errorf("updating item: %w", err)
-	}
-
-	detail, _ := json.Marshal(changes)
-	if err := db.insertAudit(ctx, tx, "item", id, "updated", string(detail)); err != nil {
-		return nil, fmt.Errorf("writing audit log: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return db.GetItem(ctx, id)
+	return db.UpdateItemFields(ctx, id, ItemUpdate{Fields: ItemFields{
+		Title: p.Title, Description: p.Description, Label: p.Label, Component: p.Component,
+	}})
 }
 
-// UpdateItemAssignee changes an item's assignee and records the before/after
-// values in audit_log, in the same transaction as the update. An empty
-// assignee clears it (unassigns), same as any other free-text field's
-// nullIfEmpty convention.
+// UpdateItemAssignee sets or clears an item's assignee (empty clears).
+// A wrapper over UpdateItemFields.
 func (db *DB) UpdateItemAssignee(ctx context.Context, id, assignee string) (*Item, error) {
-	tx, err := db.conn.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var oldAssignee sql.NullString
-	var deletedAt sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT assignee, deleted_at FROM items WHERE id = ?`, id).Scan(&oldAssignee, &deletedAt)
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("item %q not found", id)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("looking up item %q: %w", id, err)
-	}
-	if deletedAt.Valid {
-		return nil, errDeleted("item", id)
-	}
-
-	now := nowUTC()
-	if _, err := tx.ExecContext(ctx, `UPDATE items SET assignee = ?, updated_at = ? WHERE id = ?`, nullIfEmpty(assignee), now, id); err != nil {
-		return nil, fmt.Errorf("updating assignee: %w", err)
-	}
-
-	detail, _ := json.Marshal(map[string]string{"from": oldAssignee.String, "to": assignee})
-	if err := db.insertAudit(ctx, tx, "item", id, "assigned", string(detail)); err != nil {
-		return nil, fmt.Errorf("writing audit log: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-
-	return db.GetItem(ctx, id)
+	return db.UpdateItemFields(ctx, id, ItemUpdate{Fields: ItemFields{Assignee: &assignee}})
 }
