@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS workflows (
   project_id      TEXT NOT NULL REFERENCES projects(id),
   status          TEXT NOT NULL,
   current_version INTEGER NOT NULL,
+  project_level   INTEGER NOT NULL DEFAULT 0,
   created_by      TEXT,
   created_at      TEXT NOT NULL,
   updated_at      TEXT NOT NULL,
@@ -125,6 +126,9 @@ CREATE TABLE IF NOT EXISTS workflow_versions (
   created_at  TEXT NOT NULL,
   UNIQUE (workflow_id, version)
 );
+-- project_level: 1 for a project workflow -- an end-to-end journey or a
+-- cross-cutting flow meant for the project as a whole, rather than for one
+-- epic or story. Added 2026-09-30; store.go adds it to older databases.
 -- workflow_versions has no deleted_at: versions are history, like audit_log.
 -- Deleting a workflow soft-deletes the workflows row; its versions remain.
 

@@ -88,6 +88,7 @@ type Store interface {
 	UnlinkWorkflowTicket(ctx context.Context, workflowID, partKey, itemID, role string) error
 	ListWorkflowLinks(ctx context.Context, workflowID, itemID string) ([]WorkflowLink, error)
 	GetWorkflowProgress(ctx context.Context, id string, version int) (*WorkflowProgress, error)
+	SetWorkflowProjectLevel(ctx context.Context, id string, projectLevel bool) (*Workflow, error)
 	SearchWorkflows(ctx context.Context, projectID, query string) ([]Workflow, error)
 	DiffWorkflowVersions(ctx context.Context, id string, from, to int) ([]WorkflowChange, error)
 	CreateGapTickets(ctx context.Context, workflowID string, keys []string, parentID, itemType string) ([]GapTicketResult, error)
@@ -298,6 +299,12 @@ func open(opts Options) (*DB, error) {
 		return nil, err
 	}
 	if err := ensureColumn(conn, "items", "assignee", "TEXT"); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	// Project workflows (2026-09-30). Existing workflows become 0: none was
+	// created as a project workflow, so nothing is guessed.
+	if err := ensureColumn(conn, "workflows", "project_level", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		conn.Close()
 		return nil, err
 	}

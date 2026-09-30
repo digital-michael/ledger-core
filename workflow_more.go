@@ -242,6 +242,10 @@ func (db *DB) CreateGapTickets(ctx context.Context, workflowID string, keys []st
 // into referenced workflows (Miller's 7 +/- 2). A hint, not an error.
 const maxReadableSteps = 9
 
+// projectRestateSteps: a project workflow this long with no references is
+// probably restating epic/story workflows. A hint, not an error.
+const projectRestateSteps = 4
+
 func (db *DB) checkWorkflows(ctx context.Context) ([]Finding, error) {
 	var out []Finding
 
@@ -249,7 +253,7 @@ func (db *DB) checkWorkflows(ctx context.Context) ([]Finding, error) {
 	found, err := db.collect(ctx, `
 		SELECT w.id, v.title, w.status FROM workflows w
 		JOIN workflow_versions v ON v.workflow_id = w.id AND v.version = w.current_version
-		WHERE w.deleted_at IS NULL AND w.status <> 'archived'
+		WHERE w.deleted_at IS NULL AND w.status <> 'archived' AND w.project_level = 0
 		  AND NOT EXISTS (SELECT 1 FROM workflow_associations a JOIN items i ON i.id = a.item_id
 		                  WHERE a.workflow_id = w.id AND a.deleted_at IS NULL AND i.deleted_at IS NULL)
 		ORDER BY v.title`,
@@ -334,6 +338,21 @@ func (db *DB) checkWorkflows(ctx context.Context) ([]Finding, error) {
 				}
 				out = append(out, Finding{Check: "workflow_ref_retired", EntityType: "workflow", EntityID: w.ID, Title: w.Version.Title,
 					Detail: "References workflow " + r.WorkflowID + ", which is " + what + ".", Fix: ""})
+			}
+		}
+		// A project workflow should compose epic/story workflows, not restate
+		// them: several steps and no references suggests duplication.
+		if w.ProjectLevel && len(doc.Steps) >= projectRestateSteps {
+			refs := 0
+			for _, st := range doc.Steps {
+				if st.Ref != nil {
+					refs++
+				}
+			}
+			if refs == 0 {
+				out = append(out, Finding{Check: "workflow_project_restates", EntityType: "workflow", EntityID: w.ID, Title: w.Version.Title,
+					Detail: fmt.Sprintf("A project workflow with %d steps and no references to epic or story workflows. Consider making its steps references, so each behaviour is described once.", len(doc.Steps)),
+					Fix:    ""})
 			}
 		}
 		if n := len(doc.Steps); n > maxReadableSteps {

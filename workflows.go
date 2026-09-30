@@ -32,11 +32,15 @@ type Workflow struct {
 	ProjectID      string
 	Status         string
 	CurrentVersion int
-	CreatedBy      sql.NullString
-	CreatedAt      string
-	UpdatedAt      string
-	DeletedAt      sql.NullString
-	Version        WorkflowVersion
+	// ProjectLevel marks a project workflow: an end-to-end journey across
+	// epics, or a cross-cutting flow, meant for the project as a whole. It
+	// should mostly reference epic/story workflows rather than restate them.
+	ProjectLevel bool
+	CreatedBy    sql.NullString
+	CreatedAt    string
+	UpdatedAt    string
+	DeletedAt    sql.NullString
+	Version      WorkflowVersion
 }
 
 // WorkflowVersion is one saved, immutable version.
@@ -76,6 +80,8 @@ type CreateWorkflowParams struct {
 	Doc        WorkflowDoc
 	ChangeNote string
 	Status     string
+	// ProjectLevel creates a project workflow.
+	ProjectLevel bool
 }
 
 // WorkflowFilter narrows ListWorkflows. Archived workflows are left out
@@ -88,6 +94,10 @@ type WorkflowFilter struct {
 	ItemID string
 	// Unassociated keeps only workflows with no live association.
 	Unassociated bool
+	// ProjectLevelOnly keeps only project workflows; EpicLevelOnly only the
+	// others.
+	ProjectLevelOnly bool
+	EpicLevelOnly    bool
 }
 
 // queryer is what *sql.DB and *sql.Tx share for reads.
@@ -130,14 +140,14 @@ func (db *DB) CreateWorkflow(ctx context.Context, p CreateWorkflowParams) (*Work
 	now := nowUTC()
 	by := nullIfEmpty(db.currentActor(ctx).String())
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO workflows (id, project_id, status, current_version, created_by, created_at, updated_at)
-		 VALUES (?, ?, ?, 1, ?, ?, ?)`, id, p.ProjectID, status, by, now, now); err != nil {
+		`INSERT INTO workflows (id, project_id, status, current_version, project_level, created_by, created_at, updated_at)
+		 VALUES (?, ?, ?, 1, ?, ?, ?, ?)`, id, p.ProjectID, status, p.ProjectLevel, by, now, now); err != nil {
 		return nil, fmt.Errorf("inserting workflow: %w", err)
 	}
 	if err := insertVersion(ctx, tx, id, 1, &doc, p.ChangeNote, by, now); err != nil {
 		return nil, err
 	}
-	detail, _ := json.Marshal(map[string]any{"title": doc.Title, "version": 1, "status": status})
+	detail, _ := json.Marshal(map[string]any{"title": doc.Title, "version": 1, "status": status, "project_level": p.ProjectLevel})
 	if err := db.insertAudit(ctx, tx, "workflow", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
 	}
@@ -248,6 +258,38 @@ func (db *DB) SetWorkflowStatus(ctx context.Context, id, status string) (*Workfl
 	return db.GetWorkflow(ctx, resolved, 0)
 }
 
+// SetWorkflowProjectLevel makes a workflow a project workflow, or not. The
+// content is untouched, so no new version; the change is audited.
+func (db *DB) SetWorkflowProjectLevel(ctx context.Context, id string, projectLevel bool) (*Workflow, error) {
+	resolved, err := db.resolveWorkflowID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := refuseIfDeleted(ctx, tx, "workflow", "workflows", resolved); err != nil {
+		return nil, err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE workflows SET project_level = ?, updated_at = ? WHERE id = ? AND project_level <> ?`,
+		projectLevel, nowUTC(), resolved, projectLevel)
+	if err != nil {
+		return nil, fmt.Errorf("updating workflow: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		detail, _ := json.Marshal(map[string]bool{"project_level": projectLevel})
+		if err := db.insertAudit(ctx, tx, "workflow", resolved, "scope_changed", string(detail)); err != nil {
+			return nil, fmt.Errorf("writing audit log: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return db.GetWorkflow(ctx, resolved, 0)
+}
+
 // GetWorkflow returns a workflow with its current version, or with version
 // n when n > 0. Like GetItem it accepts a unique id prefix and returns a
 // soft-deleted workflow (DeletedAt set) for inspection before a restore.
@@ -258,9 +300,9 @@ func (db *DB) GetWorkflow(ctx context.Context, id string, version int) (*Workflo
 	}
 	w := &Workflow{}
 	if err := db.conn.QueryRowContext(ctx,
-		`SELECT id, project_id, status, current_version, created_by, created_at, updated_at, deleted_at
+		`SELECT id, project_id, status, current_version, project_level, created_by, created_at, updated_at, deleted_at
 		 FROM workflows WHERE id = ?`, resolved).
-		Scan(&w.ID, &w.ProjectID, &w.Status, &w.CurrentVersion, &w.CreatedBy, &w.CreatedAt, &w.UpdatedAt, &w.DeletedAt); err != nil {
+		Scan(&w.ID, &w.ProjectID, &w.Status, &w.CurrentVersion, &w.ProjectLevel, &w.CreatedBy, &w.CreatedAt, &w.UpdatedAt, &w.DeletedAt); err != nil {
 		return nil, fmt.Errorf("reading workflow %q: %w", resolved, err)
 	}
 	if version <= 0 {
@@ -296,6 +338,12 @@ func (db *DB) ListWorkflows(ctx context.Context, f WorkflowFilter) ([]Workflow, 
 	if f.ItemID != "" {
 		q += ` AND EXISTS (SELECT 1 FROM workflow_associations a WHERE a.workflow_id = w.id AND a.item_id = ? AND a.deleted_at IS NULL)`
 		args = append(args, f.ItemID)
+	}
+	if f.ProjectLevelOnly {
+		q += ` AND w.project_level = 1`
+	}
+	if f.EpicLevelOnly {
+		q += ` AND w.project_level = 0`
 	}
 	if f.Unassociated {
 		q += ` AND NOT EXISTS (SELECT 1 FROM workflow_associations a JOIN items i ON i.id = a.item_id

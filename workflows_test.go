@@ -614,3 +614,63 @@ func TestWorkflowHealthFindings(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectWorkflows(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	mustTyped(t, db, p.ID, "task", "keeps the project non-empty")
+	epicFlow := mustWorkflow(t, db, p.ID, WorkflowDoc{Title: "Create a project", Goal: "g", Steps: []WorkflowStep{{Action: "a"}}})
+	journey, err := db.CreateWorkflow(ctx, CreateWorkflowParams{ProjectID: p.ID, ProjectLevel: true, Doc: WorkflowDoc{
+		Title: "New member journey", Goal: "a member is working",
+		Steps: []WorkflowStep{{Ref: &WorkflowRef{WorkflowID: epicFlow.ID}}, {Action: "invite a teammate"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !journey.ProjectLevel || epicFlow.ProjectLevel {
+		t.Fatalf("flags: journey=%v epic=%v", journey.ProjectLevel, epicFlow.ProjectLevel)
+	}
+	only, _ := db.ListWorkflows(ctx, WorkflowFilter{ProjectID: p.ID, ProjectLevelOnly: true})
+	others, _ := db.ListWorkflows(ctx, WorkflowFilter{ProjectID: p.ID, EpicLevelOnly: true})
+	if len(only) != 1 || only[0].ID != journey.ID || len(others) != 1 || others[0].ID != epicFlow.ID {
+		t.Errorf("filters: project=%d others=%d", len(only), len(others))
+	}
+
+	checks := func() map[string][]string {
+		t.Helper()
+		f, err := db.HealthFindings(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string][]string{}
+		for _, x := range f {
+			m[x.Check] = append(m[x.Check], x.EntityID)
+		}
+		return m
+	}
+	// A project workflow is not "unassociated"; the unused epic-level one is.
+	if got := checks()["workflow_unassociated"]; len(got) != 1 || got[0] != epicFlow.ID {
+		t.Errorf("unassociated: %v", got)
+	}
+
+	// Flip the flag both ways, audited, no new version.
+	w, err := db.SetWorkflowProjectLevel(ctx, epicFlow.ID, true)
+	if err != nil || !w.ProjectLevel || w.CurrentVersion != 1 {
+		t.Fatalf("set project level: %v %+v", err, w)
+	}
+	db.SetWorkflowProjectLevel(ctx, epicFlow.ID, true) // no change, no audit row
+	audit, _ := db.ListAuditLog(ctx, AuditFilter{EntityID: epicFlow.ID, Operation: "scope_changed"})
+	if len(audit) != 1 {
+		t.Errorf("scope audit rows: %d", len(audit))
+	}
+
+	// A project workflow restating steps (4+, no references) gets a hint.
+	restate := WorkflowDoc{Title: "Restates", Goal: "g"}
+	for i := 0; i < 4; i++ {
+		restate.Steps = append(restate.Steps, WorkflowStep{Action: "step"})
+	}
+	r, _ := db.CreateWorkflow(ctx, CreateWorkflowParams{ProjectID: p.ID, ProjectLevel: true, Doc: restate})
+	if got := checks()["workflow_project_restates"]; len(got) != 1 || got[0] != r.ID {
+		t.Errorf("restates hint: %v", got)
+	}
+}
