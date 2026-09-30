@@ -94,6 +94,70 @@ CREATE TABLE IF NOT EXISTS audit_log (
 -- which bypasses the real protocol entirely and has no client to name.
 -- Populated automatically by insertAudit() from context; no caller passes it.
 
+-- Workflows (added 2026-09-29): how a goal is achieved, as versioned
+-- use-case documents linked to epics/stories and to the tickets that
+-- implement or verify each step. See workflows.go.
+--
+-- workflows holds identity and lifecycle only; the content lives in
+-- workflow_versions, one immutable row per saved version, as a validated
+-- JSON document (WorkflowDoc). title is copied out of the document for
+-- listing. The two link tables are what needs querying and integrity:
+-- which epics/stories a workflow serves, and which tickets sit on which step.
+CREATE TABLE IF NOT EXISTS workflows (
+  id              TEXT PRIMARY KEY,
+  project_id      TEXT NOT NULL REFERENCES projects(id),
+  status          TEXT NOT NULL,
+  current_version INTEGER NOT NULL,
+  created_by      TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  deleted_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS workflow_versions (
+  id          TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id),
+  version     INTEGER NOT NULL,
+  title       TEXT NOT NULL,
+  document    TEXT NOT NULL,
+  change_note TEXT,
+  created_by  TEXT,
+  created_at  TEXT NOT NULL,
+  UNIQUE (workflow_id, version)
+);
+-- workflow_versions has no deleted_at: versions are history, like audit_log.
+-- Deleting a workflow soft-deletes the workflows row; its versions remain.
+
+CREATE TABLE IF NOT EXISTS workflow_associations (
+  id             TEXT PRIMARY KEY,
+  workflow_id    TEXT NOT NULL REFERENCES workflows(id),
+  item_id        TEXT NOT NULL REFERENCES items(id),
+  pinned_version INTEGER,
+  created_at     TEXT NOT NULL,
+  deleted_at     TEXT
+);
+-- pinned_version: NULL follows the workflow's current version.
+
+CREATE TABLE IF NOT EXISTS workflow_links (
+  id          TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL REFERENCES workflows(id),
+  part_key    TEXT NOT NULL,
+  item_id     TEXT NOT NULL REFERENCES items(id),
+  role        TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  deleted_at  TEXT
+);
+-- part_key: a stable key inside the workflow's documents (s3, s3.r1, a1 ...).
+-- It survives edits; if a later version drops that part, the link is kept
+-- and reported by HealthFindings rather than removed (docs/ledger.md U14).
+
+CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_versions_workflow ON workflow_versions(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_assoc_workflow ON workflow_associations(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_assoc_item ON workflow_associations(item_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_links_workflow ON workflow_links(workflow_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_links_item ON workflow_links(item_id);
+
 CREATE INDEX IF NOT EXISTS idx_items_project ON items(project_id);
 CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
 -- idx_items_component intentionally NOT here: on a pre-existing database

@@ -14,10 +14,12 @@ package ledgercore
 // Values are storage keys, not display labels: "in_progress", not
 // "In progress". Presentation belongs to the caller.
 type Vocabulary struct {
-	ItemTypes     []string
-	Statuses      []string
-	RelationTypes []string
-	NoteTypes     []string
+	ItemTypes         []string
+	Statuses          []string
+	RelationTypes     []string
+	NoteTypes         []string
+	WorkflowStatuses  []string
+	WorkflowLinkRoles []string
 }
 
 // Note types. Only NoteTypeComment is writable through AddNote; the two timer
@@ -58,6 +60,19 @@ var (
 	relationTypes = []string{"blocked_by", "depends_on", "related_to", "part_of"}
 
 	noteTypes = []string{NoteTypeComment, NoteTypeTimeStarted, NoteTypeTimeEnded}
+
+	// workflowStatuses: draft while being written, active once in use,
+	// archived when retired -- hidden from default lists and closed to new
+	// associations and references, while existing links still resolve.
+	workflowStatuses = []string{"draft", "active", "archived"}
+
+	// workflowLinkRoles: a ticket either builds a part of a workflow or tests
+	// it. Only implements counts toward covering a gap.
+	workflowLinkRoles = []string{"implements", "verifies"}
+
+	// workflowItemTypes: the item types a workflow can be associated with.
+	// Not a stored column, so no trigger -- checked on write only.
+	workflowItemTypes = []string{"epic", "story"}
 )
 
 // Derived lookup sets. Derived, never hand-written, so they cannot drift from
@@ -69,6 +84,9 @@ var (
 	validRelationTypes = setOf(relationTypes)
 	validNoteTypes     = setOf(noteTypes)
 
+	validWorkflowStatuses  = setOf(workflowStatuses)
+	validWorkflowLinkRoles = setOf(workflowLinkRoles)
+	validWorkflowItemTypes = setOf(workflowItemTypes)
 )
 
 // Vocab returns the ledger's vocabulary. Each call returns fresh slices, so
@@ -79,6 +97,9 @@ func Vocab() Vocabulary {
 		Statuses:      append([]string(nil), statuses...),
 		RelationTypes: append([]string(nil), relationTypes...),
 		NoteTypes:     append([]string(nil), noteTypes...),
+
+		WorkflowStatuses:  append([]string(nil), workflowStatuses...),
+		WorkflowLinkRoles: append([]string(nil), workflowLinkRoles...),
 	}
 }
 

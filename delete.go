@@ -18,6 +18,11 @@ var deletableTables = map[string]string{
 	"resource":      "resources",
 	"note":          "notes",
 	"item_relation": "item_relations",
+	// Workflows (2026-09-29). workflow_versions is deliberately absent: a
+	// version is history, not an entity to remove.
+	"workflow":             "workflows",
+	"workflow_association": "workflow_associations",
+	"workflow_link":        "workflow_links",
 }
 
 // SoftDelete marks an entity as deleted (deleted_at = now) without removing

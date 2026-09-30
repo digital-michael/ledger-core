@@ -74,6 +74,21 @@ type Store interface {
 	ListRelations(ctx context.Context, itemID string) ([]ItemRelation, error)
 	ListProjectRelations(ctx context.Context, projectID string) ([]ItemRelation, error)
 
+	// Workflows (workflows.go)
+	CreateWorkflow(ctx context.Context, p CreateWorkflowParams) (*Workflow, error)
+	UpdateWorkflow(ctx context.Context, id string, doc WorkflowDoc, baseVersion int, changeNote string) (*Workflow, error)
+	SetWorkflowStatus(ctx context.Context, id, status string) (*Workflow, error)
+	GetWorkflow(ctx context.Context, id string, version int) (*Workflow, error)
+	ListWorkflows(ctx context.Context, f WorkflowFilter) ([]Workflow, error)
+	ListWorkflowVersions(ctx context.Context, id string) ([]WorkflowVersion, error)
+	AssociateWorkflow(ctx context.Context, workflowID, itemID string, pinnedVersion int) (*WorkflowAssociation, error)
+	DisassociateWorkflow(ctx context.Context, workflowID, itemID string) error
+	ListWorkflowAssociations(ctx context.Context, workflowID string) ([]WorkflowAssociation, error)
+	LinkWorkflowTicket(ctx context.Context, workflowID, partKey, itemID, role string) (*WorkflowLink, error)
+	UnlinkWorkflowTicket(ctx context.Context, workflowID, partKey, itemID, role string) error
+	ListWorkflowLinks(ctx context.Context, workflowID, itemID string) ([]WorkflowLink, error)
+	GetWorkflowProgress(ctx context.Context, id string, version int) (*WorkflowProgress, error)
+
 	// Cross-cutting
 	HealthFindings(ctx context.Context) ([]Finding, error)
 	SummarizeProject(ctx context.Context, projectID, projectKey string) (*ProjectSummary, error)

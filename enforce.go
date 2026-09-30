@@ -39,6 +39,8 @@ func vocabRules() []vocabRule {
 		{"items", "status", statuses},
 		{"item_relations", "relation_type", relationTypes},
 		{"notes", "type", noteTypes},
+		{"workflows", "status", workflowStatuses},
+		{"workflow_links", "role", workflowLinkRoles},
 	}
 }
 
