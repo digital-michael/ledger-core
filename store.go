@@ -88,6 +88,9 @@ type Store interface {
 	UnlinkWorkflowTicket(ctx context.Context, workflowID, partKey, itemID, role string) error
 	ListWorkflowLinks(ctx context.Context, workflowID, itemID string) ([]WorkflowLink, error)
 	GetWorkflowProgress(ctx context.Context, id string, version int) (*WorkflowProgress, error)
+	SearchWorkflows(ctx context.Context, projectID, query string) ([]Workflow, error)
+	DiffWorkflowVersions(ctx context.Context, id string, from, to int) ([]WorkflowChange, error)
+	CreateGapTickets(ctx context.Context, workflowID string, keys []string, parentID, itemType string) ([]GapTicketResult, error)
 
 	// Cross-cutting
 	HealthFindings(ctx context.Context) ([]Finding, error)

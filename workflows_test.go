@@ -472,3 +472,145 @@ func TestWorkflowScopeFeaturesConstraints(t *testing.T) {
 		t.Errorf("empty constraint: %v", err)
 	}
 }
+
+func TestSearchWorkflows(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	q := mustProject(t, db, "other")
+	mustWorkflow(t, db, p.ID, sampleDoc())
+	mustWorkflow(t, db, q.ID, WorkflowDoc{Title: "Close a project", Goal: "closed", Steps: []WorkflowStep{{Action: "archive"}}})
+
+	for _, c := range []struct {
+		project, query string
+		want           int
+	}{
+		{"", "new-project form", 1}, // text inside a result
+		{"", "PROJECT", 2},          // case-insensitive, titles
+		{p.ID, "project", 1},        // narrowed to a project
+		{"", "nowhere", 0},
+	} {
+		got, err := db.SearchWorkflows(ctx, c.project, c.query)
+		if err != nil || len(got) != c.want {
+			t.Errorf("search %q in %q: %d results, %v (want %d)", c.query, c.project, len(got), err, c.want)
+		}
+	}
+}
+
+func TestDiffWorkflowVersions(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	w := mustWorkflow(t, db, p.ID, sampleDoc())
+	d := w.Version.Doc
+	d.Goal = "changed goal"
+	d.Steps = []WorkflowStep{d.Steps[1], d.Steps[0], d.Steps[2]} // s1 and s2 swap
+	d.Steps[2].Action = "Click Save now"                         // s3 changes
+	d.Steps[2].Results = d.Steps[2].Results[:1]                  // s3.r2 removed
+	d.Features = []WorkflowItem{{Text: "a feature"}}             // f1 added
+	d.Parameters[0].Value = "http://example.test"
+	if _, err := db.UpdateWorkflow(ctx, w.ID, d, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	changes, err := db.DiffWorkflowVersions(ctx, w.ID, 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, c := range changes {
+		got[c.Key] = c.Change
+	}
+	want := map[string]string{"goal": "changed", "f1": "added", "s1": "moved", "s2": "moved", "s3": "changed",
+		"s3.r2": "removed", "parameter:base_url": "changed"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: got %q, want %q (all: %v)", k, got[k], v, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("unexpected extra changes: %v", got)
+	}
+	if none, _ := db.DiffWorkflowVersions(ctx, w.ID, 2, 2); len(none) != 0 {
+		t.Errorf("a version against itself: %v", none)
+	}
+}
+
+func TestCreateGapTickets(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	story := mustTyped(t, db, p.ID, "story", "Story")
+	w := mustWorkflow(t, db, p.ID, sampleDoc())
+	before, _ := db.GetWorkflowProgress(ctx, w.ID, 0)
+
+	// A subset, including a key that is not a gap.
+	res, err := db.CreateGapTickets(ctx, w.ID, []string{"s1", "p1"}, story.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 2 || res[0].ItemID == "" || res[0].Error != nil || res[1].Error == nil {
+		t.Fatalf("subset: %+v", res)
+	}
+	it, _ := db.GetItem(ctx, res[0].ItemID)
+	if it.Title != "Open {base_url}" || it.ParentID.String != story.ID || it.Type != "task" {
+		t.Errorf("created ticket: %+v", it)
+	}
+
+	// All remaining gaps.
+	res, err = db.CreateGapTickets(ctx, w.ID, nil, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != len(before.Gaps)-1 {
+		t.Errorf("remaining gaps: created %d, want %d", len(res), len(before.Gaps)-1)
+	}
+	after, _ := db.GetWorkflowProgress(ctx, w.ID, 0)
+	if len(after.Gaps) != 0 {
+		t.Errorf("gaps left: %+v", after.Gaps)
+	}
+	// One batch id per call.
+	audit, _ := db.ListAuditLog(ctx, AuditFilter{EntityType: "workflow_link"})
+	batches := map[string]bool{}
+	for _, a := range audit {
+		batches[a.Batch.String] = true
+	}
+	if len(batches) != 2 {
+		t.Errorf("want 2 batches (one per call), got %d", len(batches))
+	}
+}
+
+func TestWorkflowHealthFindings(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	mustTyped(t, db, p.ID, "task", "keeps the project non-empty")
+	sub := mustWorkflow(t, db, p.ID, WorkflowDoc{Title: "Sub", Goal: "g", Steps: []WorkflowStep{{Action: "a"}}})
+	long := WorkflowDoc{Title: "Long", Goal: "g", Steps: []WorkflowStep{{Ref: &WorkflowRef{WorkflowID: sub.ID}}}}
+	for i := 0; i < 10; i++ {
+		long.Steps = append(long.Steps, WorkflowStep{Action: "step"})
+	}
+	w := mustWorkflow(t, db, p.ID, long)
+	gone := mustTyped(t, db, p.ID, "task", "to be deleted")
+	orphan := mustTyped(t, db, p.ID, "task", "on a removed step")
+	db.LinkWorkflowTicket(ctx, w.ID, "s2", gone.ID, "implements")
+	db.LinkWorkflowTicket(ctx, w.ID, "s11", orphan.ID, "implements")
+	db.SoftDelete(ctx, "item", gone.ID)
+	d := w.Version.Doc
+	d.Steps = d.Steps[:10] // drop s11
+	if _, err := db.UpdateWorkflow(ctx, w.ID, d, 1, ""); err != nil {
+		t.Fatal(err)
+	}
+	db.SetWorkflowStatus(ctx, sub.ID, "archived")
+
+	findings, err := db.HealthFindings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, f := range findings {
+		got[f.Check]++
+	}
+	want := map[string]int{"workflow_unassociated": 1, "workflow_link_deleted_ticket": 1, "workflow_link_orphaned": 1,
+		"workflow_ref_retired": 1, "workflow_long": 1}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s: %d findings, want %d (all: %v)", k, got[k], v, got)
+		}
+	}
+}

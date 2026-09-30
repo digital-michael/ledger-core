@@ -22,7 +22,7 @@ import (
 // Finding is one thing worth a look.
 type Finding struct {
 	Check      string // stable identifier, e.g. "empty_project"
-	EntityType string // project | item | item_relation | note | resource
+	EntityType string // project | item | item_relation | note | resource | workflow | workflow_link
 	EntityID   string
 	Title      string // what the thing is called, for a person reading the list
 	Detail     string // what is wrong with it
@@ -45,6 +45,7 @@ func (db *DB) HealthFindings(ctx context.Context) ([]Finding, error) {
 		db.checkOffVocabulary,
 		db.checkRunningTimers,
 		db.checkMissingComponents,
+		db.checkWorkflows,
 	} {
 		found, err := check(ctx)
 		if err != nil {
