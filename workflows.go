@@ -601,7 +601,7 @@ func (db *DB) ListWorkflowLinks(ctx context.Context, workflowID, itemID string) 
 // WorkflowGap is a part of a workflow that no live ticket implements.
 type WorkflowGap struct {
 	Key  string // s3, s3.r1, a1 ...
-	Kind string // step, result, alternate, alternate_result
+	Kind string // step, result, alternate, alternate_result, feature
 	Text string
 }
 
@@ -731,6 +731,13 @@ func (db *DB) progress(ctx context.Context, wid string, version int, visiting ma
 	for _, a := range w.Version.Doc.AlternatePaths {
 		_, _, gaps := covered(a.Key, "alternate", a.Condition, a.Results, "alternate_result")
 		p.Gaps = append(p.Gaps, gaps...)
+	}
+	// Features need building, so an unimplemented one is a gap. Scope and
+	// constraints are checked, not built, and never are.
+	for _, f := range w.Version.Doc.Features {
+		if impl[f.Key] == nil {
+			p.Gaps = append(p.Gaps, WorkflowGap{Key: f.Key, Kind: "feature", Text: f.Text})
+		}
 	}
 	return p, nil
 }

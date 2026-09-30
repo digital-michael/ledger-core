@@ -17,6 +17,8 @@ import (
 // inserted, removed or reordered. Keys are assigned by this package, never
 // reused within a workflow, and are human-readable:
 //
+//	i1, i2        in scope        o1, o2        not in scope
+//	f1, f2        features        c1, c2        constraints
 //	p1, p2        preconditions
 //	s1, s2        steps           s2.r1, s2.r2  a step's expected results
 //	a1, a2        alternate paths a1.r1         an alternate path's results
@@ -29,11 +31,25 @@ type WorkflowDoc struct {
 	Title          string              `json:"title"`
 	Goal           string              `json:"goal"`
 	Actor          string              `json:"actor,omitempty"`
+	InScope        []WorkflowItem      `json:"in_scope,omitempty"`
+	OutOfScope     []WorkflowItem      `json:"out_of_scope,omitempty"`
+	Features       []WorkflowItem      `json:"features,omitempty"`
+	Constraints    []WorkflowItem      `json:"constraints,omitempty"`
 	Parameters     []WorkflowParam     `json:"parameters,omitempty"`
 	Preconditions  []WorkflowCondition `json:"preconditions,omitempty"`
 	Steps          []WorkflowStep      `json:"steps"`
 	AlternatePaths []WorkflowAltPath   `json:"alternate_paths,omitempty"`
 	Postconditions []WorkflowCondition `json:"postconditions,omitempty"`
+}
+
+// WorkflowItem is one entry in a workflow-level list: what is in or out of
+// scope, a feature the workflow delivers, a constraint it must respect.
+// Features need building, so an unlinked feature is a gap; scope and
+// constraints are checked rather than built, so they never are -- all four
+// can still carry ticket links.
+type WorkflowItem struct {
+	Key  string `json:"key,omitempty"`
+	Text string `json:"text"`
 }
 
 // WorkflowParam is a named value the steps refer to as {name}, so one
@@ -89,6 +105,11 @@ var paramNameRE = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 // what it names. The order is document order.
 func (d *WorkflowDoc) keyedParts() []keyedPart {
 	var parts []keyedPart
+	for _, sec := range d.itemSections() {
+		for _, it := range *sec.items {
+			parts = append(parts, keyedPart{it.Key, sec.kind})
+		}
+	}
 	for _, c := range d.Preconditions {
 		parts = append(parts, keyedPart{c.Key, "precondition"})
 	}
@@ -111,6 +132,24 @@ func (d *WorkflowDoc) keyedParts() []keyedPart {
 }
 
 type keyedPart struct{ key, kind string }
+
+// itemSection is one workflow-level list of WorkflowItems.
+type itemSection struct {
+	items  *[]WorkflowItem
+	prefix string // key prefix: i, o, f, c
+	kind   string // in_scope, out_of_scope, feature, constraint
+	label  string // for messages
+}
+
+// itemSections lists the workflow-level lists in document order.
+func (d *WorkflowDoc) itemSections() []itemSection {
+	return []itemSection{
+		{&d.InScope, "i", "in_scope", "in-scope item"},
+		{&d.OutOfScope, "o", "out_of_scope", "not-in-scope item"},
+		{&d.Features, "f", "feature", "feature"},
+		{&d.Constraints, "c", "constraint", "constraint"},
+	}
+}
 
 // refs returns every workflow reference in the document.
 func (d *WorkflowDoc) refs() []WorkflowRef {
@@ -155,6 +194,13 @@ func (d *WorkflowDoc) validateShape() error {
 			return docError("parameter %q is defined twice", p.Name)
 		}
 		seen[p.Name] = true
+	}
+	for _, sec := range d.itemSections() {
+		for i, it := range *sec.items {
+			if strings.TrimSpace(it.Text) == "" {
+				return docError("%s %d: text is required", sec.label, i+1)
+			}
+		}
 	}
 	for i, c := range d.Preconditions {
 		if err := checkCondition("precondition", i, c); err != nil {
@@ -226,6 +272,15 @@ func (d *WorkflowDoc) assignKeys(issued map[string]bool) error {
 	}
 	// Claim every existing key first, so a new key can never collide with an
 	// existing one that appears later in the document.
+	for _, sec := range d.itemSections() {
+		for _, it := range *sec.items {
+			if it.Key != "" {
+				if err := claim(it.Key, sec.label); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	for _, c := range d.Preconditions {
 		if c.Key != "" {
 			if err := claim(c.Key, "precondition"); err != nil {
@@ -276,6 +331,14 @@ func (d *WorkflowDoc) assignKeys(issued map[string]bool) error {
 			if !used(k) {
 				inDoc[k] = true
 				return k
+			}
+		}
+	}
+	for _, sec := range d.itemSections() {
+		items := *sec.items
+		for i := range items {
+			if items[i].Key == "" {
+				items[i].Key = next(sec.prefix)
 			}
 		}
 	}

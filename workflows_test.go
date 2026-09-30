@@ -405,3 +405,70 @@ func TestWorkflowVocabularyTriggers(t *testing.T) {
 		t.Error("trigger should reject an off-vocabulary link role")
 	}
 }
+
+func TestWorkflowScopeFeaturesConstraints(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	d := sampleDoc()
+	d.InScope = []WorkflowItem{{Text: "creating public projects"}}
+	d.OutOfScope = []WorkflowItem{{Text: "team projects"}, {Text: "importing projects"}}
+	d.Features = []WorkflowItem{{Text: "visibility flag"}, {Text: "owner list"}}
+	d.Constraints = []WorkflowItem{{Text: "works without JavaScript for reads"}}
+	w := mustWorkflow(t, db, p.ID, d)
+
+	got := w.Version.Doc
+	keys := func(items []WorkflowItem) string {
+		var k []string
+		for _, it := range items {
+			k = append(k, it.Key)
+		}
+		return strings.Join(k, " ")
+	}
+	if keys(got.InScope) != "i1" || keys(got.OutOfScope) != "o1 o2" || keys(got.Features) != "f1 f2" || keys(got.Constraints) != "c1" {
+		t.Errorf("keys: in=%s out=%s features=%s constraints=%s", keys(got.InScope), keys(got.OutOfScope), keys(got.Features), keys(got.Constraints))
+	}
+
+	// Features are gaps until implemented; scope and constraints never are.
+	prog, _ := db.GetWorkflowProgress(ctx, w.ID, 0)
+	var featureGaps []string
+	for _, g := range prog.Gaps {
+		switch g.Kind {
+		case "feature":
+			featureGaps = append(featureGaps, g.Key)
+		case "in_scope", "out_of_scope", "constraint":
+			t.Errorf("%s should never be a gap: %+v", g.Kind, g)
+		}
+	}
+	if strings.Join(featureGaps, " ") != "f1 f2" {
+		t.Errorf("feature gaps: %v", featureGaps)
+	}
+	task := mustTyped(t, db, p.ID, "task", "build the flag")
+	if _, err := db.LinkWorkflowTicket(ctx, w.ID, "f1", task.ID, "implements"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LinkWorkflowTicket(ctx, w.ID, "c1", task.ID, "verifies"); err != nil {
+		t.Errorf("constraints are linkable: %v", err)
+	}
+	prog, _ = db.GetWorkflowProgress(ctx, w.ID, 0)
+	for _, g := range prog.Gaps {
+		if g.Key == "f1" {
+			t.Error("an implemented feature is still a gap")
+		}
+	}
+
+	// Removing o1 and adding another out-of-scope item does not reuse o1;
+	// empty text is refused.
+	got.OutOfScope = []WorkflowItem{got.OutOfScope[1], {Text: "archiving"}}
+	w2, err := db.UpdateWorkflow(ctx, w.ID, got, 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := keys(w2.Version.Doc.OutOfScope); k != "o2 o3" {
+		t.Errorf("out-of-scope keys after edit: %s (want o2 o3)", k)
+	}
+	bad := w2.Version.Doc
+	bad.Constraints = append(bad.Constraints, WorkflowItem{Text: " "})
+	if _, err := db.UpdateWorkflow(ctx, w.ID, bad, 2, ""); err == nil || !strings.Contains(err.Error(), "constraint 2: text is required") {
+		t.Errorf("empty constraint: %v", err)
+	}
+}
