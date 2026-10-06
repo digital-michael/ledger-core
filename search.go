@@ -9,9 +9,11 @@ import (
 // SearchResult is one match from SearchItems -- MatchedIn names which field
 // matched ("title", "description", or "note") so a caller can tell an
 // item-level match from a note-level one; Snippet carries the matching
-// note's body for note matches, empty otherwise.
+// note's body for note matches, empty otherwise. ProjectID is the item's
+// project, so a search across every project can say where each hit lives.
 type SearchResult struct {
 	ItemID    string
+	ProjectID string
 	Title     string
 	Type      string
 	Status    string
@@ -34,7 +36,7 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 
 	// SQLite decides which field matched (title_match), rather than a Go
 	// substring test: with wildcards in the pattern the two would disagree.
-	itemQuery := `SELECT id, title, type, status, (title LIKE ? ESCAPE '\') FROM items
+	itemQuery := `SELECT id, project_id, title, type, status, (title LIKE ? ESCAPE '\') FROM items
 		WHERE deleted_at IS NULL AND (title LIKE ? ESCAPE '\' OR description LIKE ? ESCAPE '\')`
 	itemArgs := []any{like, like, like}
 	if projectID != "" {
@@ -48,9 +50,9 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 		return nil, err
 	}
 	for itemRows.Next() {
-		var id, title, typ, status string
+		var id, projectID, title, typ, status string
 		var titleMatch bool
-		if err := itemRows.Scan(&id, &title, &typ, &status, &titleMatch); err != nil {
+		if err := itemRows.Scan(&id, &projectID, &title, &typ, &status, &titleMatch); err != nil {
 			itemRows.Close()
 			return nil, err
 		}
@@ -58,7 +60,7 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 		if titleMatch {
 			matchedIn = "title"
 		}
-		results = append(results, SearchResult{ItemID: id, Title: title, Type: typ, Status: status, MatchedIn: matchedIn})
+		results = append(results, SearchResult{ItemID: id, ProjectID: projectID, Title: title, Type: typ, Status: status, MatchedIn: matchedIn})
 	}
 	if err := itemRows.Err(); err != nil {
 		itemRows.Close()
@@ -66,7 +68,7 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 	}
 	itemRows.Close()
 
-	noteQuery := `SELECT items.id, items.title, items.type, items.status, notes.body
+	noteQuery := `SELECT items.id, items.project_id, items.title, items.type, items.status, notes.body
 		FROM notes JOIN items ON notes.item_id = items.id
 		WHERE notes.deleted_at IS NULL AND items.deleted_at IS NULL AND notes.body LIKE ? ESCAPE '\'`
 	noteArgs := []any{like}
@@ -82,13 +84,13 @@ func (db *DB) SearchItems(ctx context.Context, projectID, query string) ([]Searc
 	}
 	defer noteRows.Close()
 	for noteRows.Next() {
-		var id, title, typ, status string
+		var id, projectID, title, typ, status string
 		var body sql.NullString
-		if err := noteRows.Scan(&id, &title, &typ, &status, &body); err != nil {
+		if err := noteRows.Scan(&id, &projectID, &title, &typ, &status, &body); err != nil {
 			return nil, err
 		}
 		results = append(results, SearchResult{
-			ItemID: id, Title: title, Type: typ, Status: status,
+			ItemID: id, ProjectID: projectID, Title: title, Type: typ, Status: status,
 			MatchedIn: "note", Snippet: body.String,
 		})
 	}

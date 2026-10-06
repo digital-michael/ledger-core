@@ -970,6 +970,20 @@ func TestSearchPatterns(t *testing.T) {
 	if got := ids("tokenizer"); !has(got, parser+":description") {
 		t.Errorf("description match: %v", got)
 	}
+	// Across every project, each hit -- item or note match -- says which
+	// project it lives in.
+	all, err := db.SearchItems(ctx, "", "parser")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Errorf("all-projects search: %d hits, want 2", len(all))
+	}
+	for _, r := range all {
+		if r.ProjectID != p.ID {
+			t.Errorf("%s match %s: project %q, want %q", r.MatchedIn, r.ItemID, r.ProjectID, p.ID)
+		}
+	}
 	if got := ids("Write*parser"); !has(got, parser+":title") {
 		t.Errorf("* wildcard: %v", got)
 	}
