@@ -44,15 +44,19 @@ func (db *DB) SoftDelete(ctx context.Context, entityType, id string) error {
 	}
 	defer tx.Rollback()
 
+	now := nowUTC()
 	res, err := tx.ExecContext(ctx,
 		fmt.Sprintf(`UPDATE %s SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL`, table),
-		nowUTC(), id,
+		now, id,
 	)
 	if err != nil {
 		return fmt.Errorf("deleting %s %q: %w", entityType, id, err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("%s %q not found or already deleted", entityType, id)
+	}
+	if err := touchOwningWorkflow(ctx, tx, entityType, id, now); err != nil {
+		return err
 	}
 
 	if err := db.insertAudit(ctx, tx, entityType, id, "deleted", ""); err != nil {
@@ -88,6 +92,9 @@ func (db *DB) Restore(ctx context.Context, entityType, id string) error {
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("%s %q not found or not deleted", entityType, id)
+	}
+	if err := touchOwningWorkflow(ctx, tx, entityType, id, nowUTC()); err != nil {
+		return err
 	}
 
 	if err := db.insertAudit(ctx, tx, entityType, id, "restored", ""); err != nil {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Workflow tests run against a real SQLite ledger, like the rest of this
@@ -672,5 +673,88 @@ func TestProjectWorkflows(t *testing.T) {
 	r, _ := db.CreateWorkflow(ctx, CreateWorkflowParams{ProjectID: p.ID, ProjectLevel: true, Doc: restate})
 	if got := checks()["workflow_project_restates"]; len(got) != 1 || got[0] != r.ID {
 		t.Errorf("restates hint: %v", got)
+	}
+}
+
+// Any change to a workflow moves its updated_at -- links, associations,
+// deletes and restores, not only versions (d3b827d6). A refused write and a
+// status change on a linked ticket do not.
+func TestWorkflowUpdatedAtFollowsEveryChange(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "wf")
+	w := mustWorkflow(t, db, p.ID, sampleDoc())
+	task := mustTyped(t, db, p.ID, "task", "build step 1")
+	story := mustTyped(t, db, p.ID, "story", "the story")
+
+	stamp := func() time.Time {
+		t.Helper()
+		g, err := db.GetWorkflow(ctx, w.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		at, err := time.Parse(time.RFC3339Nano, g.UpdatedAt)
+		if err != nil {
+			t.Fatalf("updated_at %q: %v", g.UpdatedAt, err)
+		}
+		return at
+	}
+	var linkID, assocID string
+	moves := []struct {
+		name string
+		do   func() error
+	}{
+		{"link", func() error {
+			l, err := db.LinkWorkflowTicket(ctx, w.ID, "s1", task.ID, "implements")
+			if l != nil {
+				linkID = l.ID
+			}
+			return err
+		}},
+		{"unlink", func() error { return db.UnlinkWorkflowTicket(ctx, w.ID, "s1", task.ID, "implements") }},
+		{"restore link", func() error { return db.Restore(ctx, "workflow_link", linkID) }},
+		{"associate", func() error {
+			a, err := db.AssociateWorkflow(ctx, w.ID, story.ID, 0)
+			if a != nil {
+				assocID = a.ID
+			}
+			return err
+		}},
+		{"disassociate", func() error { return db.DisassociateWorkflow(ctx, w.ID, story.ID) }},
+		{"restore association", func() error { return db.Restore(ctx, "workflow_association", assocID) }},
+		{"delete workflow", func() error { return db.SoftDelete(ctx, "workflow", w.ID) }},
+		{"restore workflow", func() error { return db.Restore(ctx, "workflow", w.ID) }},
+	}
+	for _, m := range moves {
+		before := stamp()
+		time.Sleep(2 * time.Millisecond)
+		if err := m.do(); err != nil {
+			t.Fatalf("%s: %v", m.name, err)
+		}
+		if after := stamp(); !after.After(before) {
+			t.Errorf("%s did not move updated_at: %v -> %v", m.name, before, after)
+		}
+	}
+
+	stays := []struct {
+		name string
+		do   func() error
+	}{
+		{"refused duplicate link", func() error {
+			if _, err := db.LinkWorkflowTicket(ctx, w.ID, "s1", task.ID, "implements"); err == nil {
+				t.Error("duplicate link should be refused")
+			}
+			return nil
+		}},
+		{"linked ticket status change", func() error { _, err := db.UpdateItemStatus(ctx, task.ID, "done"); return err }},
+	}
+	for _, s := range stays {
+		before := stamp()
+		time.Sleep(2 * time.Millisecond)
+		if err := s.do(); err != nil {
+			t.Fatalf("%s: %v", s.name, err)
+		}
+		if after := stamp(); !after.Equal(before) {
+			t.Errorf("%s moved updated_at: %v -> %v", s.name, before, after)
+		}
 	}
 }

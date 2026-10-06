@@ -466,6 +466,9 @@ func (db *DB) AssociateWorkflow(ctx context.Context, workflowID, itemID string, 
 		VALUES (?, ?, ?, ?, ?)`, a.ID, wid, iid, a.PinnedVersion, a.CreatedAt); err != nil {
 		return nil, fmt.Errorf("inserting association: %w", err)
 	}
+	if err := touchWorkflow(ctx, tx, wid, a.CreatedAt); err != nil {
+		return nil, err
+	}
 	detail, _ := json.Marshal(map[string]any{"workflow_id": wid, "item_id": iid, "pinned_version": pinnedVersion})
 	if err := db.insertAudit(ctx, tx, "workflow_association", a.ID, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
@@ -574,6 +577,9 @@ func (db *DB) LinkWorkflowTicket(ctx context.Context, workflowID, partKey, itemI
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workflow_links (id, workflow_id, part_key, item_id, role, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)`, l.ID, wid, partKey, iid, role, l.CreatedAt); err != nil {
 		return nil, fmt.Errorf("inserting link: %w", err)
+	}
+	if err := touchWorkflow(ctx, tx, wid, l.CreatedAt); err != nil {
+		return nil, err
 	}
 	detail, _ := json.Marshal(map[string]string{"workflow_id": wid, "part_key": partKey, "item_id": iid, "role": role})
 	if err := db.insertAudit(ctx, tx, "workflow_link", l.ID, "created", string(detail)); err != nil {
@@ -837,6 +843,35 @@ func liveWorkflow(ctx context.Context, tx *sql.Tx, wid string) (string, int, err
 		return "", 0, errDeleted("workflow", wid)
 	}
 	return status, current, nil
+}
+
+// touchWorkflow records that a workflow changed. Any change to a workflow
+// counts -- its ticket links, its associations, a delete or restore -- not
+// only a new version, a status or a scope change. Changes to the linked
+// tickets themselves do not. Runs inside the caller's transaction.
+func touchWorkflow(ctx context.Context, tx *sql.Tx, wid, now string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE workflows SET updated_at = ? WHERE id = ?`, now, wid); err != nil {
+		return fmt.Errorf("touching workflow %q: %w", wid, err)
+	}
+	return nil
+}
+
+// touchOwningWorkflow is touchWorkflow for a soft delete or restore: the
+// workflow itself, or the workflow a link or association belongs to. Other
+// entity types are left alone.
+func touchOwningWorkflow(ctx context.Context, tx *sql.Tx, entityType, id, now string) error {
+	wid := id
+	switch entityType {
+	case "workflow":
+	case "workflow_link", "workflow_association":
+		if err := tx.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT workflow_id FROM %s WHERE id = ?`, deletableTables[entityType]), id).Scan(&wid); err != nil {
+			return fmt.Errorf("looking up the workflow of %s %q: %w", entityType, id, err)
+		}
+	default:
+		return nil
+	}
+	return touchWorkflow(ctx, tx, wid, now)
 }
 
 // issuedKeysAndRefs collects every key any version of the workflow ever
