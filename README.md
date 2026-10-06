@@ -53,8 +53,18 @@ The tests open real SQLite databases in temp directories through the public `Ope
 concurrency test re-executes the test binary as 5 separate writer processes, because SQLite's
 cross-process locking is what's under test.
 
-## Status
+## Status and releases
 
-Not yet published to GitHub. `mcp-local` consumes it through a `replace => ../ledger-core`
-directive, so **`mcp-local` must not be pushed until this repo is published** and that directive
-is swapped for a pinned version.
+Published at `github.com/digital-michael/ledger-core` with semver tags (annotated, with a
+one-paragraph summary). Consumers -- `mcp-local` and `ledger-server` -- pin a tagged version in
+`go.mod`, so a build outside this workspace (another machine, CI, a container image for a remote
+deployment) is reproducible.
+
+Local development across the three repos uses `cortex/go.work`, which is not committed: it
+builds the consumers against this checkout. A change here is therefore live locally before it is
+released, and **not** in any standalone build until it is. After a change lands:
+
+1. Tag a release: patch for fixes and behaviour corrections with no API change, minor for new
+   API. Push the tag.
+2. Bump the pin in each consumer (`GOWORK=off go get github.com/digital-michael/ledger-core@vX.Y.Z`,
+   then `GOWORK=off go mod tidy`), and confirm `GOWORK=off go build ./...` and the tests pass.
