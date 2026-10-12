@@ -17,6 +17,18 @@ CREATE TABLE IF NOT EXISTS projects (
   deleted_at TEXT
 );
 
+-- project_aliases: old keys of a renamed project. A lookup by key that finds
+-- no project falls back to this table, so git-root inference, saved links and
+-- scripts that still use the old key keep reaching the same project instead of
+-- creating a new, empty one. Added 2026-10-11 with RenameProjectKey. An alias
+-- is never a live key: a key and an alias cannot be the same string.
+CREATE TABLE IF NOT EXISTS project_aliases (
+  alias_key  TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_aliases_project ON project_aliases(project_id);
+
 CREATE TABLE IF NOT EXISTS items (
   id          TEXT PRIMARY KEY,
   project_id  TEXT NOT NULL REFERENCES projects(id),

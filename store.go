@@ -39,6 +39,14 @@ type Store interface {
 	GetOrCreateProjectForWrite(ctx context.Context, key, name string) (*Project, error)
 	GetProjectByID(ctx context.Context, id string) (*Project, error)
 	ListProjects(ctx context.Context) ([]Project, error)
+	// RenameProject changes a project's display name; the key is untouched.
+	RenameProject(ctx context.Context, key, newName string) (*Project, error)
+	// RenameProjectKey gives a project a new key and keeps the old one as an alias.
+	RenameProjectKey(ctx context.Context, key, newKey string) (*Project, error)
+	// ProjectKeyForAlias maps an old key to the project's current key.
+	ProjectKeyForAlias(ctx context.Context, alias string) (key string, ok bool, err error)
+	// ProjectAliases lists a project's old keys.
+	ProjectAliases(ctx context.Context, projectID string) ([]string, error)
 
 	// Items
 	CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
@@ -50,6 +58,8 @@ type Store interface {
 	// one transaction, optional conflict check. The four below are wrappers
 	// kept for the callers that already use them.
 	UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*Item, error)
+	// MoveItem moves an item (and with it, optionally, its descendants) to another existing project.
+	MoveItem(ctx context.Context, id, targetKey string, opt MoveOptions) (*MoveResult, error)
 	UpdateItem(ctx context.Context, id string, p UpdateItemParams) (*Item, error)
 	UpdateItemStatus(ctx context.Context, id, status string) (*Item, error)
 	BulkUpdateItemStatus(ctx context.Context, ids []string, status string) []BulkStatusResult

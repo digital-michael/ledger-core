@@ -20,6 +20,8 @@ type Operation string
 const (
 	OpChangeItemType   Operation = "change_item_type"    // what a ticket is, after the fact
 	OpReparentItem     Operation = "reparent_item"       // restructures the hierarchy
+	OpRenameProject    Operation = "rename_project"      // changes how a project is shown everywhere
+	OpMoveItem         Operation = "move_item"           // takes tickets out of one project and into another
 	OpDeleteProject    Operation = "delete_project"      // affects every ticket in it
 	OpRestoreProject   Operation = "restore_project"     //
 	OpBulkUpdateStatus Operation = "bulk_update_status"  // one action, many tickets
