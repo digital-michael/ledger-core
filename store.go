@@ -47,6 +47,8 @@ type Store interface {
 	ProjectKeyForAlias(ctx context.Context, alias string) (key string, ok bool, err error)
 	// ProjectAliases lists a project's old keys.
 	ProjectAliases(ctx context.Context, projectID string) ([]string, error)
+	// AllProjectAliases lists every live project's old keys, by project id.
+	AllProjectAliases(ctx context.Context) (map[string][]string, error)
 
 	// Items
 	CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)

@@ -345,3 +345,24 @@ func (db *DB) ProjectAliases(ctx context.Context, projectID string) ([]string, e
 	}
 	return out, rows.Err()
 }
+
+// AllProjectAliases returns every live project's old keys, by project id, each
+// list oldest first. One query, for the screens that show them beside every
+// project. Projects without aliases are absent.
+func (db *DB) AllProjectAliases(ctx context.Context) (map[string][]string, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT a.project_id, a.alias_key FROM project_aliases a
+		JOIN projects p ON p.id = a.project_id WHERE p.deleted_at IS NULL ORDER BY a.created_at, a.alias_key`)
+	if err != nil {
+		return nil, fmt.Errorf("listing aliases: %w", err)
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var id, alias string
+		if err := rows.Scan(&id, &alias); err != nil {
+			return nil, err
+		}
+		out[id] = append(out[id], alias)
+	}
+	return out, rows.Err()
+}

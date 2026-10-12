@@ -165,3 +165,27 @@ func TestAliasTableIsAddedToAnExistingDatabase(t *testing.T) {
 		t.Errorf("alias after migration: %+v", via)
 	}
 }
+
+func TestAllProjectAliasesListsEachProjectsOldKeysOldestFirst(t *testing.T) {
+	db := openTest(t)
+	a, b := mustProject(t, db, "a"), mustProject(t, db, "b")
+	mustProject(t, db, "plain")
+	db.RenameProjectKey(ctx, "a", "a2")
+	db.RenameProjectKey(ctx, "a2", "a3")
+	db.RenameProjectKey(ctx, "b", "b2")
+
+	got, err := db.AllProjectAliases(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || len(got[a.ID]) != 2 || got[a.ID][0] != "a" || got[a.ID][1] != "a2" || len(got[b.ID]) != 1 || got[b.ID][0] != "b" {
+		t.Errorf("aliases: %v", got)
+	}
+	// A deleted project's aliases are not listed.
+	if err := db.SoftDelete(ctx, "project", b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = db.AllProjectAliases(ctx); len(got[b.ID]) != 0 {
+		t.Errorf("a deleted project's aliases are listed: %v", got)
+	}
+}
