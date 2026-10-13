@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // The ledger's own linter: what in its data is wrong, hidden, or stale.
@@ -39,6 +40,7 @@ func (db *DB) HealthFindings(ctx context.Context) ([]Finding, error) {
 	var all []Finding
 	for _, check := range []func(context.Context) ([]Finding, error){
 		db.checkEmptyProjects,
+		db.checkProjectBurst,
 		db.checkItemsInDeletedProjects,
 		db.checkDeletedParents,
 		db.checkDanglingRelations,
@@ -235,4 +237,60 @@ func (db *DB) collectArgs(ctx context.Context, query string, args []any, build f
 		out = append(out, build(a.String, b.String, c.String))
 	}
 	return out, rows.Err()
+}
+
+// How many new live projects in how long count as a burst. A person starts a project now and then; a script, or a
+// model passing project ids as keys, starts dozens at once (52 in one day, 2026-10-12).
+const (
+	projectBurstCount  = 5
+	projectBurstWindow = 24 * time.Hour
+)
+
+// checkProjectBurst is the early warning for a flood of new projects. empty_project already lists each empty one,
+// but only on a page nobody opens; this one finding says HOW MANY appeared and WHEN, and it is repairable, so
+// the visible health count (ledger-server's Health link, ledger_list_projects) turns on at the first sign.
+func (db *DB) checkProjectBurst(ctx context.Context) ([]Finding, error) {
+	rows, err := db.conn.QueryContext(ctx, `SELECT created_at FROM projects WHERE deleted_at IS NULL ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("checking for a burst of new projects: %w", err)
+	}
+	defer rows.Close()
+	cutoff := time.Now().UTC().Add(-projectBurstWindow)
+	var recent []time.Time
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		t, err := time.Parse(time.RFC3339Nano, s) // parse, never compare the strings: trailing zeros are trimmed
+		if err == nil && t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(recent) < projectBurstCount {
+		return nil, nil
+	}
+	newest := recent[0]
+	return []Finding{{
+		Check: "project_burst", EntityType: "project", EntityID: "",
+		Title: fmt.Sprintf("%d new projects in 24 hours", len(recent)),
+		Detail: fmt.Sprintf("%d projects were created in the last 24 hours (the newest at %s). People start a project now and then; a burst usually means writes to mistyped keys or a script. "+
+			"Look at them with ledger_list_projects; an empty one is safe to delete.", len(recent), newest.Format("2006-01-02 15:04 MST")),
+		Fix: "ledger_list_projects",
+	}}, nil
+}
+
+// Repairable counts the findings that carry a repair command (Fix != ""). The rest are advice that needs a decision
+// (workflow structure, for example) and would make a permanent count that nobody reads.
+func Repairable(findings []Finding) int {
+	n := 0
+	for _, f := range findings {
+		if f.Fix != "" {
+			n++
+		}
+	}
+	return n
 }

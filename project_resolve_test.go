@@ -191,3 +191,74 @@ func TestResolveProjectAnEmptyDeletedProjectDoesNotShadowTheRealOne(t *testing.T
 		t.Errorf("a deleted project that holds data stays readable: %+v %v", got, err)
 	}
 }
+
+func projectsCreatedAt(t *testing.T, db *DB, key string, when string) {
+	t.Helper()
+	if _, err := db.conn.Exec(`UPDATE projects SET created_at = ? WHERE key = ?`, when, key); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHealthProjectBurstFlagsAFloodOfNewProjectsAndNotOrdinaryGrowth(t *testing.T) {
+	burst := func(db *DB) []Finding {
+		found, err := db.HealthFindings(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []Finding
+		for _, f := range found {
+			if f.Check == "project_burst" {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+
+	db := openTest(t)
+	for i := 0; i < projectBurstCount-1; i++ {
+		mustProject(t, db, "p"+string(rune('a'+i)))
+	}
+	if got := burst(db); len(got) != 0 {
+		t.Fatalf("%d new projects is ordinary growth, not a burst: %+v", projectBurstCount-1, got)
+	}
+	mustProject(t, db, "one-more")
+	got := burst(db)
+	if len(got) != 1 {
+		t.Fatalf("%d new projects in a day is a burst: %+v", projectBurstCount, got)
+	}
+	if !strings.Contains(got[0].Title, "5 new projects in 24 hours") || got[0].Fix == "" || !strings.Contains(got[0].Detail, "mistyped keys") {
+		t.Errorf("the finding should say how many, carry a repair command and explain: %+v", got[0])
+	}
+
+	// Old projects do not count, however many there are.
+	old := openTest(t)
+	for i := 0; i < 8; i++ {
+		key := "old" + string(rune('a'+i))
+		mustProject(t, old, key)
+		projectsCreatedAt(t, old, key, "2026-01-01T00:00:00Z")
+	}
+	if got := burst(old); len(got) != 0 {
+		t.Errorf("projects older than a day are not a burst: %+v", got)
+	}
+
+	// Cleaning up resolves it: soft-deleted projects are history.
+	for _, k := range []string{"pa", "pb", "pc"} {
+		p, _ := db.ResolveProject(ctx, k)
+		if err := db.SoftDelete(ctx, "project", p.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := burst(db); len(got) != 0 {
+		t.Errorf("after deleting the extra projects the burst is gone: %+v", got)
+	}
+}
+
+func TestRepairableCountsOnlyFindingsThatCarryARepairCommand(t *testing.T) {
+	found := []Finding{{Check: "empty_project", Fix: "ledger_delete entity_type=project id=x"}, {Check: "workflow_long"}, {Check: "workflow_project_restates"}, {Check: "project_burst", Fix: "ledger_list_projects"}}
+	if got := Repairable(found); got != 2 {
+		t.Errorf("Repairable = %d, want 2 (advice that needs a decision is not repairable)", got)
+	}
+	if Repairable(nil) != 0 {
+		t.Errorf("no findings, nothing to repair")
+	}
+}
