@@ -366,3 +366,169 @@ func (db *DB) AllProjectAliases(ctx context.Context) (map[string][]string, error
 	}
 	return out, rows.Err()
 }
+
+// ProjectNotFoundError says no project matches a reference, and names the likely ones, so the caller can retry
+// with the right key instead of being handed an empty result. It unwraps to ErrNotFound.
+type ProjectNotFoundError struct {
+	Ref        string
+	Candidates []Project // close matches: same name or last path segment once case, spaces, "-" and "_" are ignored
+	Keys       []string  // live project keys, for the message (capped)
+	MoreKeys   int       // how many live keys are not in Keys
+}
+
+func (e *ProjectNotFoundError) Unwrap() error { return ErrNotFound }
+
+func (e *ProjectNotFoundError) Error() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "project %q not found", e.Ref)
+	if len(e.Candidates) > 0 {
+		sb.WriteString(". Did you mean: ")
+		for i, c := range e.Candidates {
+			if i > 0 {
+				sb.WriteString("; ")
+			}
+			if c.Name != "" && c.Name != c.Key {
+				fmt.Fprintf(&sb, "%q (named %q)", c.Key, c.Name)
+			} else {
+				fmt.Fprintf(&sb, "%q", c.Key)
+			}
+		}
+		sb.WriteString("?")
+	}
+	if len(e.Keys) > 0 {
+		sb.WriteString(" Projects: " + strings.Join(e.Keys, ", "))
+		if e.MoreKeys > 0 {
+			fmt.Fprintf(&sb, ", and %d more", e.MoreKeys)
+		}
+		sb.WriteString(".")
+	}
+	sb.WriteString(" (ledger_list_projects shows them; a project is created by writing to a new key, not by reading one.)")
+	return sb.String()
+}
+
+// projectLooseKey makes two spellings of one project name comparable: "Space Sim", "space_sim" and "space-sim" match.
+func projectLooseKey(s string) string {
+	var out []rune
+	for _, r := range strings.ToLower(s) {
+		if r != ' ' && r != '_' && r != '-' {
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+// ResolveProject finds the project a reference means WITHOUT creating anything. The reference is tried as, in order:
+// the project's key, an old key it was renamed from, the project's id, and its display name (case-insensitive, only
+// when one project has it). A soft-deleted project is returned too, because its data stays readable; a caller that
+// is about to write uses ResolveProjectForWrite. Nothing matching returns a *ProjectNotFoundError with the likely
+// candidates. Found 2026-10-13: reads used to CREATE the project for an unknown key and answer with an empty list;
+// a small model passing a project id or a display name made 52 empty projects in a day.
+func (db *DB) ResolveProject(ctx context.Context, ref string) (*Project, error) {
+	p, _, err := db.resolveProject(ctx, ref)
+	return p, err
+}
+
+// ResolveProjectForWrite is ResolveProject for a caller about to attach new data: a soft-deleted project is
+// reported (ErrProjectSoftDeleted) instead of used. Not finding one is still a *ProjectNotFoundError, so the
+// caller can decide that writing to a new key means creating it.
+func (db *DB) ResolveProjectForWrite(ctx context.Context, ref string) (*Project, error) {
+	p, deleted, err := db.resolveProject(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if deleted {
+		return nil, &ErrProjectSoftDeleted{Key: p.Key, ID: p.ID}
+	}
+	return p, nil
+}
+
+func (db *DB) resolveProject(ctx context.Context, ref string) (p *Project, deleted bool, err error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, false, errors.New("a project is required")
+	}
+	// A soft-deleted project is still readable because its data is (no cascade). One with NOTHING in it has no data
+	// to read, and answering from it would shadow the project the caller meant with an empty result, so it counts
+	// as not found. (Found 2026-10-13: the cleanup of 52 empty junk projects left a deleted `space_sim`, which then
+	// hid the real, renamed Space Sim behind "no items".)
+	usable := func(id string, deletedAt sql.NullString) bool {
+		return !deletedAt.Valid || !db.projectIsEmpty(ctx, id)
+	}
+	// 1 and 2: the key, then an old key.
+	found, deletedAt, ferr := findProject(ctx, db.conn, ref)
+	if ferr == nil && usable(found.ID, deletedAt) {
+		return &found, deletedAt.Valid, nil
+	}
+	if ferr != nil && ferr != sql.ErrNoRows {
+		return nil, false, fmt.Errorf("looking up project %q: %w", ref, ferr)
+	}
+	// 3: the id, which ledger_list_projects prints beside every key.
+	var byID Project
+	var idDeleted sql.NullString
+	err = db.conn.QueryRowContext(ctx, `SELECT id, key, name, deleted_at FROM projects WHERE id = ?`, ref).Scan(&byID.ID, &byID.Key, &byID.Name, &idDeleted)
+	if err == nil && usable(byID.ID, idDeleted) {
+		return &byID, idDeleted.Valid, nil
+	}
+	if err != nil && err != sql.ErrNoRows {
+		return nil, false, fmt.Errorf("looking up project %q: %w", ref, err)
+	}
+	// 4: a display name that belongs to exactly one live project.
+	live, err := db.ListProjects(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var named []Project
+	for _, lp := range live {
+		if strings.EqualFold(lp.Name, ref) {
+			named = append(named, lp)
+		}
+	}
+	switch len(named) {
+	case 1:
+		return &named[0], false, nil
+	case 0:
+	default:
+		keys := make([]string, 0, len(named))
+		for _, n := range named {
+			keys = append(keys, fmt.Sprintf("%q", n.Key))
+		}
+		return nil, false, fmt.Errorf("project name %q matches several projects (%s); use the key", ref, strings.Join(keys, ", "))
+	}
+	return nil, false, db.projectNotFound(live, ref)
+}
+
+func (db *DB) projectNotFound(live []Project, ref string) error {
+	const maxCandidates, maxKeys = 5, 15
+	loose := projectLooseKey(ref)
+	e := &ProjectNotFoundError{Ref: ref}
+	for _, lp := range live {
+		last := lp.Key
+		if i := strings.LastIndexAny(last, "/\\"); i >= 0 {
+			last = last[i+1:]
+		}
+		if loose != "" && (projectLooseKey(lp.Name) == loose || projectLooseKey(last) == loose || projectLooseKey(lp.Key) == loose) {
+			if len(e.Candidates) < maxCandidates {
+				e.Candidates = append(e.Candidates, lp)
+			}
+		}
+	}
+	for i, lp := range live {
+		if i < maxKeys {
+			e.Keys = append(e.Keys, lp.Key)
+		} else {
+			e.MoreKeys++
+		}
+	}
+	return e
+}
+
+// projectIsEmpty reports whether a project holds nothing at all: no items (live or deleted), notes, resources or
+// workflows. Errors count as "not empty", so a failing query never hides data.
+func (db *DB) projectIsEmpty(ctx context.Context, projectID string) bool {
+	var n int
+	err := db.conn.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM items WHERE project_id = ?) + (SELECT COUNT(*) FROM notes WHERE project_id = ?) +
+		(SELECT COUNT(*) FROM resources WHERE project_id = ?) + (SELECT COUNT(*) FROM workflows WHERE project_id = ?)`,
+		projectID, projectID, projectID, projectID).Scan(&n)
+	return err == nil && n == 0
+}

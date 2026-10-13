@@ -39,6 +39,10 @@ type Store interface {
 	GetOrCreateProjectForWrite(ctx context.Context, key, name string) (*Project, error)
 	GetProjectByID(ctx context.Context, id string) (*Project, error)
 	ListProjects(ctx context.Context) ([]Project, error)
+	// ResolveProject finds the project a reference means (key, old key, id or unique display name) without creating one.
+	ResolveProject(ctx context.Context, ref string) (*Project, error)
+	// ResolveProjectForWrite is ResolveProject for a caller about to write: a soft-deleted project is reported, not used.
+	ResolveProjectForWrite(ctx context.Context, ref string) (*Project, error)
 	// RenameProject changes a project's display name; the key is untouched.
 	RenameProject(ctx context.Context, key, newName string) (*Project, error)
 	// RenameProjectKey gives a project a new key and keeps the old one as an alias.
