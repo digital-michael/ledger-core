@@ -10,7 +10,7 @@ program that touches the ledger database.
 
 Extracted from `mcp-local/internal/store/ledger` on 2026-09-10, with its git history, so the MCP tools
 and the web UI cannot drift apart on validation, audit logging, soft delete or id resolution.
-Design record: `cortex/docs/ledger.md`. Tracking: ledger project `ledger-server`, epic `d28ed3b2`.
+Design record: `datum-core/docs/ledger.md`. Tracking: ledger project `ledger-server`, epic `d28ed3b2`.
 
 ## Using it
 
@@ -60,7 +60,7 @@ one-paragraph summary). Consumers -- `mcp-local` and `ledger-server` -- pin a ta
 `go.mod`, so a build outside this workspace (another machine, CI, a container image for a remote
 deployment) is reproducible.
 
-Local development across the three repos uses `cortex/go.work`, which is not committed: it
+Local development across the three repos uses `datum-core/go.work`, which is not committed: it
 builds the consumers against this checkout. A change here is therefore live locally before it is
 released, and **not** in any standalone build until it is. After a change lands:
 

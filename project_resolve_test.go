@@ -52,7 +52,7 @@ func TestResolveProjectUnknownIsAnErrorThatNamesTheLikelyOnesAndCreatesNothing(t
 	path := "/Users/me/Photon Datum/space_sim"
 	mustProject(t, db, path)
 	db.RenameProject(ctx, path, "Space Sim")
-	mustProject(t, db, "cortex-stack")
+	mustProject(t, db, "datum-stack")
 	before := projectCount(t, db)
 
 	// The two things the small model really passed on 2026-10-12: the old short name, and an invented id.
@@ -62,7 +62,7 @@ func TestResolveProjectUnknownIsAnErrorThatNamesTheLikelyOnesAndCreatesNothing(t
 		if got != nil || !errors.As(err, &nf) || !errors.Is(err, ErrNotFound) {
 			t.Fatalf("%q: %+v %v", ref, got, err)
 		}
-		if !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "cortex-stack") {
+		if !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), "datum-stack") {
 			t.Errorf("%q: the error should say it is missing and list the projects: %v", ref, err)
 		}
 	}
