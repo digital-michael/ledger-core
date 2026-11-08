@@ -7,10 +7,10 @@ import (
 	"time"
 )
 
-// nowUTC returns the current time as an RFC3339Nano string, the format used
-// for every created_at/updated_at column in this schema.
+// nowUTC returns the current time as a fixed-width UTC stamp (see stamps.go), the
+// format used for every *_at column in this schema.
 func nowUTC() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return FormatStamp(time.Now())
 }
 
 // errDeleted is the refusal for any change to a soft-deleted entity.

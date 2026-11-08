@@ -55,10 +55,12 @@ here.
 | `projects.go`, `notes.go`, `resources.go`, `relations.go` | Projects and their key aliases, notes and timers, resources, relations between items |
 | `workflows*.go`, `workflow_doc.go` | Versioned workflow documents linked to epics, stories and tickets |
 | `audit.go`, `actor.go`, `delete.go`, `policy.go` | The audit trail, who is writing, soft delete and restore, the permission seam |
+| `stamps.go` | The fixed-width UTC timestamp format, and the one-time rewrite of stamps written before it |
 | `vocabulary.go`, `enforce.go` | The closed sets of values, and the triggers generated from them |
 | `health.go`, `search.go`, `summary.go` | The ledger's own data checks, search, project summaries |
 | `cmd/backfill-people` | One-off: fill creator and owner on records that predate those fields |
 | `cmd/drop-legacy-label`, `cmd/drop-legacy-assignee` | One-off, gated: remove an old column after the zero-loss check passes |
+| `cmd/fix-timestamps` | One-off: rewrite old variable-width stamps into the fixed-width form, all or nothing |
 
 ## Build and test
 
@@ -117,6 +119,7 @@ These hold because something went wrong once. Do not change them casually.
 - **A column that a child table replaces is copied once, then dropped by a separate gated step.**
   Opening the ledger copies each old value into its table only for records that have no row yet, so
   a removal is never undone. The drop command refuses unless every old value is represented.
+- **Every stamp is fixed-width UTC** (`2006-01-02T15:04:05.000000000Z`, 30 characters), written only through `FormatStamp`. Sorting stamps as text is then sorting them by time, which every `ORDER BY` and every `created_at >= ?` relies on. `time.RFC3339Nano` trims trailing zeros, so `…:00.5Z` sorted before `…:00Z` although it is later. A test checks every `*_at` column of every table after every kind of write.
 - **The last owner of a project cannot be removed or demoted**, including through the generic soft
   delete.
 

@@ -3,6 +3,7 @@ package ledgercore
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -54,7 +55,7 @@ func (db *DB) insertAudit(ctx context.Context, tx *sql.Tx, entityType, entityID,
 func startOfTodayUTC() string {
 	now := time.Now().UTC()
 	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	return start.Format(time.RFC3339Nano)
+	return FormatStamp(start)
 }
 
 // AuditEntry.Actor and .Batch expose the two columns added 2026-09-12; both
@@ -91,8 +92,12 @@ func (db *DB) ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, er
 		args = append(args, f.Operation)
 	}
 	if f.Since != "" {
+		bound, err := stampBound(f.Since)
+		if err != nil {
+			return nil, fmt.Errorf("since: %w", err)
+		}
 		q += ` AND created_at >= ?`
-		args = append(args, f.Since)
+		args = append(args, bound)
 	}
 	if f.Today {
 		q += ` AND created_at >= ?`
@@ -100,7 +105,7 @@ func (db *DB) ListAuditLog(ctx context.Context, f AuditFilter) ([]AuditEntry, er
 	}
 	if f.Hours > 0 {
 		q += ` AND created_at >= ?`
-		args = append(args, time.Now().UTC().Add(-time.Duration(f.Hours)*time.Hour).Format(time.RFC3339Nano))
+		args = append(args, FormatStamp(time.Now().Add(-time.Duration(f.Hours)*time.Hour)))
 	}
 	q += ` ORDER BY created_at`
 

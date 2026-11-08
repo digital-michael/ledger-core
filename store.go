@@ -90,6 +90,9 @@ type Store interface {
 	AssigneeMigrationReport(ctx context.Context) (*AssigneeGateReport, error)
 	DropLegacyAssigneeColumn(ctx context.Context) (bool, error)
 
+	// Stamps (stamps.go)
+	NormalizeTimestamps(ctx context.Context, apply bool) (*TimestampReport, error)
+
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
 	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
