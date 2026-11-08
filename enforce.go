@@ -2,7 +2,6 @@ package ledgercore
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -86,7 +85,7 @@ BEGIN SELECT RAISE(ABORT, '%s'); END`, upd, r.column, r.table, r.column, in, msg
 // first; it writes only when a trigger is missing or the vocabulary changed.
 // Safe to run from several processes at once: creation is IF NOT EXISTS, and
 // only triggers whose name differs from the current one are dropped.
-func ensureVocabTriggers(conn *sql.DB) error {
+func ensureVocabTriggers(conn *dbConn) error {
 	existing := map[string]bool{}
 	rows, err := conn.Query(`SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'ledger\_vocab\_%' ESCAPE '\'`)
 	if err != nil {

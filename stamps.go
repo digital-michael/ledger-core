@@ -2,7 +2,6 @@ package ledgercore
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
@@ -58,46 +57,35 @@ type TimestampColumn struct {
 type TimestampReport struct {
 	Columns     []TimestampColumn
 	Rewritten   int
-	Unparseable []string // "table.column rowid: value" for anything that is not a timestamp
+	Unparseable []string // "table.column pk=key: value" for anything that is not a timestamp
 	Applied     bool
 }
 
+// timestampColumn is one *_at column and the primary key of its table.
+type timestampColumn struct{ table, column, pk string }
+
 // timestampColumns lists every column named *_at in every table, so a table added
 // later is covered without anyone remembering to list it.
-func timestampColumns(ctx context.Context, tx *sql.Tx) ([][2]string, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name`)
+func timestampColumns(ctx context.Context, d dialect, q querier) ([]timestampColumn, error) {
+	tables, err := d.tables(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	var tables []string
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		tables = append(tables, n)
-	}
-	rows.Close()
-	var out [][2]string
+	var out []timestampColumn
 	for _, tb := range tables {
-		cols, err := tx.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, tb))
+		cols, err := d.columns(ctx, q, tb)
 		if err != nil {
 			return nil, err
 		}
-		for cols.Next() {
-			var cid, notnull, pk int
-			var name, ctype string
-			var dflt sql.NullString
-			if err := cols.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-				cols.Close()
-				return nil, err
-			}
-			if strings.HasSuffix(name, "_at") {
-				out = append(out, [2]string{tb, name})
+		pk, err := primaryKey(cols, tb)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cols {
+			if strings.HasSuffix(c.Name, "_at") {
+				out = append(out, timestampColumn{tb, c.Name, pk})
 			}
 		}
-		cols.Close()
 	}
 	return out, nil
 }
@@ -115,42 +103,42 @@ func (db *DB) NormalizeTimestamps(ctx context.Context, apply bool) (*TimestampRe
 	}
 	defer tx.Rollback()
 
-	cols, err := timestampColumns(ctx, tx)
+	d := db.conn.d
+	cols, err := timestampColumns(ctx, d, tx)
 	if err != nil {
 		return nil, err
 	}
 	rep := &TimestampReport{}
 	type update struct {
-		table, column string
-		rowid         int64
-		value         string
+		table, column, pk string
+		key               string // the row's primary key value
+		value             string
 	}
 	var updates []update
 	before := map[string]int{}
 	for _, c := range cols {
-		tb, col := c[0], c[1]
+		tb, col := c.table, c.column
 		line := TimestampColumn{Table: tb, Column: col}
 		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL`, tb, col)).Scan(&line.NonNull); err != nil {
 			return nil, err
 		}
 		before[tb+"."+col] = line.NonNull
-		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT rowid, %s FROM %s WHERE %s IS NOT NULL AND %s NOT GLOB '%s'`, col, tb, col, col, stampGlob))
+		rows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT %s, %s FROM %s WHERE %s IS NOT NULL AND %s`, c.pk, col, tb, col, d.notStamp(col)))
 		if err != nil {
 			return nil, err
 		}
 		for rows.Next() {
-			var rowid int64
-			var v string
-			if err := rows.Scan(&rowid, &v); err != nil {
+			var key, v string
+			if err := rows.Scan(&key, &v); err != nil {
 				rows.Close()
 				return nil, err
 			}
 			t, perr := ParseStamp(v)
 			if perr != nil {
-				rep.Unparseable = append(rep.Unparseable, fmt.Sprintf("%s.%s rowid %d: %q", tb, col, rowid, v))
+				rep.Unparseable = append(rep.Unparseable, fmt.Sprintf("%s.%s %s=%s: %q", tb, col, c.pk, key, v))
 				continue
 			}
-			updates = append(updates, update{tb, col, rowid, FormatStamp(t)})
+			updates = append(updates, update{tb, col, c.pk, key, FormatStamp(t)})
 			line.Rewritten++
 		}
 		if err := rows.Err(); err != nil {
@@ -171,16 +159,16 @@ func (db *DB) NormalizeTimestamps(ctx context.Context, apply bool) (*TimestampRe
 	}
 
 	for _, u := range updates {
-		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET %s = ? WHERE rowid = ?`, u.table, u.column), u.value, u.rowid); err != nil {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET %s = ? WHERE %s = ?`, u.table, u.column, u.pk), u.value, u.key); err != nil {
 			return nil, fmt.Errorf("rewriting %s.%s: %w", u.table, u.column, err)
 		}
 	}
 	// Verify before committing: every value is now fixed width, and no value
 	// appeared or went missing.
 	for _, c := range cols {
-		tb, col := c[0], c[1]
+		tb, col := c.table, c.column
 		var bad, n int
-		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL AND %s NOT GLOB '%s'`, tb, col, col, stampGlob)).Scan(&bad); err != nil {
+		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL AND %s`, tb, col, d.notStamp(col))).Scan(&bad); err != nil {
 			return nil, err
 		}
 		if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE %s IS NOT NULL`, tb, col)).Scan(&n); err != nil {

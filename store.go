@@ -178,7 +178,7 @@ func (f SQLiteFactory) Open() (Store, error) {
 
 // DB wraps a SQLite connection. It implements Store.
 type DB struct {
-	conn   *sql.DB
+	conn   *dbConn
 	actor  func(context.Context) Actor
 	policy func(context.Context, Actor, Operation, Target) error
 }
@@ -283,14 +283,15 @@ func open(opts Options) (*DB, error) {
 		"&_pragma=foreign_keys(ON)" +
 		"&_txlock=immediate"
 
-	conn, err := sql.Open("sqlite", dsn)
+	raw, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening db: %w", err)
 	}
-	if err := conn.Ping(); err != nil {
-		conn.Close()
+	if err := raw.Ping(); err != nil {
+		raw.Close()
 		return nil, fmt.Errorf("connecting to db: %w", err)
 	}
+	conn := &dbConn{DB: raw, d: sqliteDialect{}}
 
 	// Ping() is what actually creates the file on first use, so permissions
 	// are set after, not before.
@@ -424,7 +425,7 @@ func open(opts Options) (*DB, error) {
 
 	// Last, after every migration: the triggers reference columns that the
 	// migrations above may have just added.
-	if err := ensureVocabTriggers(conn); err != nil {
+	if err := conn.d.ensureVocab(context.Background(), conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -434,31 +435,17 @@ func open(opts Options) (*DB, error) {
 
 // ensureColumn adds column to table if it doesn't already exist. SQLite's
 // ALTER TABLE ADD COLUMN errors on a column that's already there, and has no
-// "IF NOT EXISTS" form, so this checks first via PRAGMA table_info — the one
-// small migration primitive this store needs, now that a column can be added
-// to a table that already exists in already-created database files.
-func ensureColumn(conn *sql.DB, table, column, columnType string) error {
-	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+// "IF NOT EXISTS" form, so this asks the dialect for the table's columns first --
+// the one small migration primitive this store needs, now that a column can be
+// added to a table that already exists in already-created database files.
+func ensureColumn(conn *dbConn, table, column, columnType string) error {
+	has, err := hasColumn(conn, table, column)
 	if err != nil {
-		return fmt.Errorf("inspecting %s schema: %w", table, err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, ctype string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
-		}
-		if name == column {
-			return nil // already present
-		}
-	}
-	if err := rows.Err(); err != nil {
 		return err
 	}
-
+	if has {
+		return nil // already present
+	}
 	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType)); err != nil {
 		return fmt.Errorf("adding column %s.%s: %w", table, column, err)
 	}
@@ -466,58 +453,29 @@ func ensureColumn(conn *sql.DB, table, column, columnType string) error {
 }
 
 // hasColumn reports whether table has column, without changing anything.
-func hasColumn(conn *sql.DB, table, column string) (bool, error) {
-	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+func hasColumn(conn *dbConn, table, column string) (bool, error) {
+	cols, err := conn.d.columns(context.Background(), conn.DB, table)
 	if err != nil {
-		return false, fmt.Errorf("inspecting %s schema: %w", table, err)
+		return false, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, ctype string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return false, err
-		}
-		if name == column {
+	for _, c := range cols {
+		if c.Name == column {
 			return true, nil
 		}
 	}
-	return false, rows.Err()
+	return false, nil
 }
 
 // ensureColumnDropped is ensureColumn's inverse: removes column from table if
 // present. Needed when a migrated-in column's shape itself changes later
 // (component_id, a foreign key, replaced by component, a plain
 // denormalized string) -- SQLite's ALTER TABLE DROP COLUMN has no "IF
-// EXISTS" form either, so this checks PRAGMA table_info first, same as
-// ensureColumn.
-func ensureColumnDropped(conn *sql.DB, table, column string) error {
-	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return fmt.Errorf("inspecting %s schema: %w", table, err)
-	}
-	defer rows.Close()
-
-	found := false
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, ctype string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
-		}
-		if name == column {
-			found = true
-		}
-	}
-	if err := rows.Err(); err != nil {
+// EXISTS" form either, so this checks the columns first, same as ensureColumn.
+func ensureColumnDropped(conn *dbConn, table, column string) error {
+	has, err := hasColumn(conn, table, column)
+	if err != nil || !has {
 		return err
 	}
-	if !found {
-		return nil
-	}
-
 	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", table, column)); err != nil {
 		return fmt.Errorf("dropping column %s.%s: %w", table, column, err)
 	}

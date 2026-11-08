@@ -308,7 +308,7 @@ func (db *DB) RenameProjectKey(ctx context.Context, key, newKey string) (*Projec
 	if _, err := tx.ExecContext(ctx, `UPDATE projects SET key = ?, updated_at = ? WHERE id = ?`, newKey, now, p.ID); err != nil {
 		return nil, fmt.Errorf("renaming the key: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO project_aliases (alias_key, project_id, created_at) VALUES (?, ?, ?)`, p.Key, p.ID, now); err != nil {
+	if _, err := tx.ExecContext(ctx, db.conn.d.insertIgnore("project_aliases", "alias_key", "project_id", "created_at"), p.Key, p.ID, now); err != nil {
 		return nil, fmt.Errorf("keeping the old key as an alias: %w", err)
 	}
 	detail, _ := json.Marshal(map[string]string{"from_key": p.Key, "to_key": newKey})

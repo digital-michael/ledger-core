@@ -448,7 +448,7 @@ func (db *DB) replaceItemLabelsTx(ctx context.Context, tx *sql.Tx, itemID string
 // removed -- so a label removed after the copy is never resurrected by a later
 // open, and the copy is safe to run on every open. items.label is not touched.
 // It returns how many labels were copied.
-func migrateItemLabels(ctx context.Context, conn *sql.DB) (int, error) {
+func migrateItemLabels(ctx context.Context, conn *dbConn) (int, error) {
 	if has, err := hasColumn(conn, "items", "label"); err != nil || !has {
 		return 0, err // nothing to copy: the column is gone (dropped, or a new database)
 	}

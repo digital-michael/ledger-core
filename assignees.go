@@ -489,7 +489,7 @@ func (db *DB) createPeopleTx(ctx context.Context, tx *sql.Tx, itemID, projectID 
 // is left where it is and reported by AssigneeMigrationReport, which blocks the
 // drop until a person decides. An item is copied only if it has no item_assignees
 // row at all, so a removal is never undone by a later open.
-func migrateItemAssignees(ctx context.Context, conn *sql.DB) (int, error) {
+func migrateItemAssignees(ctx context.Context, conn *dbConn) (int, error) {
 	if has, err := hasColumn(conn, "items", "assignee"); err != nil || !has {
 		return 0, err
 	}
