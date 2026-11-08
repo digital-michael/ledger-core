@@ -13,13 +13,16 @@ import (
 // SQL, but only ever from this fixed literal set, never from caller input
 // directly — an unrecognized entityType is rejected before reaching SQL.
 var deletableTables = map[string]string{
-	"project":        "projects",
-	"item":           "items",
-	"resource":       "resources",
-	"note":           "notes",
-	"item_relation":  "item_relations",
-	"item_label":     "item_labels",
-	"project_member": "project_members",
+	"project":         "projects",
+	"item":            "items",
+	"resource":        "resources",
+	"note":            "notes",
+	"item_relation":   "item_relations",
+	"item_label":      "item_labels",
+	"project_member":  "project_members",
+	"item_assignee":   "item_assignees",
+	"item_watcher":    "item_watchers",
+	"project_watcher": "project_watchers",
 	// Workflows (2026-09-29). workflow_versions is deliberately absent: a
 	// version is history, not an entity to remove.
 	"workflow":             "workflows",

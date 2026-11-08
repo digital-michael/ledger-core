@@ -90,6 +90,19 @@ type Store interface {
 	ListProjectMembers(ctx context.Context, projectID string) ([]ProjectMember, error)
 	BackfillPeople(ctx context.Context, o BackfillOptions) (*BackfillReport, error)
 
+	// Assignees and watchers (assignees.go)
+	AddAssignee(ctx context.Context, itemID, member string) (*Participant, bool, error)
+	RemoveAssignee(ctx context.Context, itemID, member string) (bool, error)
+	ListAssignees(ctx context.Context, itemID string) ([]Participant, error)
+	AddWatcher(ctx context.Context, itemID, member string) (*Participant, bool, error)
+	RemoveWatcher(ctx context.Context, itemID, member string) (bool, error)
+	ListWatchers(ctx context.Context, itemID string) ([]Participant, error)
+	AddProjectWatcher(ctx context.Context, projectID, member string) (*Participant, bool, error)
+	RemoveProjectWatcher(ctx context.Context, projectID, member string) (bool, error)
+	ListProjectWatchers(ctx context.Context, projectID string) ([]Participant, error)
+	AssigneeMigrationReport(ctx context.Context) (*AssigneeGateReport, error)
+	DropLegacyAssigneeColumn(ctx context.Context) (bool, error)
+
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
 	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
@@ -332,10 +345,6 @@ func open(opts Options) (*DB, error) {
 		conn.Close()
 		return nil, err
 	}
-	if err := ensureColumn(conn, "items", "assignee", "TEXT"); err != nil {
-		conn.Close()
-		return nil, err
-	}
 	// Project workflows (2026-09-30). Existing workflows become 0: none was
 	// created as a project workflow, so nothing is guessed.
 	if err := ensureColumn(conn, "workflows", "project_level", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -411,6 +420,16 @@ func open(opts Options) (*DB, error) {
 		return nil, fmt.Errorf("copying labels to item_labels: %w", err)
 	} else if n > 0 {
 		fmt.Fprintf(os.Stderr, "ledger: copied %d existing item labels to item_labels\n", n)
+	}
+
+	// Assignees: copy any legacy items.assignee value that has no item_assignees
+	// row yet. Idempotent; a value it cannot map to an identity is left alone and
+	// reported by AssigneeMigrationReport, which blocks the drop.
+	if n, err := migrateItemAssignees(context.Background(), conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("copying assignees to item_assignees: %w", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "ledger: copied %d existing item assignees to item_assignees\n", n)
 	}
 
 	// Last, after every migration: the triggers reference columns that the

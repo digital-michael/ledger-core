@@ -42,7 +42,6 @@ CREATE TABLE IF NOT EXISTS items (
   status      TEXT NOT NULL,
   priority    INTEGER,
   order_key   INTEGER,
-  assignee    TEXT,
   component   TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL,
@@ -229,3 +228,41 @@ CREATE TABLE IF NOT EXISTS project_members (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_members_unique ON project_members(project_id, member) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_project_members_member ON project_members(member);
+
+-- Assignees and watchers (2026-11-07, ledger story 13ed93aa): the same shape as
+-- item_labels. member is an identity "kind:id" (identity.go). Unique per owner
+-- among live rows, so a removed member can be added again. item_assignees
+-- replaces the single items.assignee column, which is no longer created here: a
+-- new database never has it, and an existing one keeps it only until
+-- DropLegacyAssigneeColumn removes it after the zero-loss check.
+CREATE TABLE IF NOT EXISTS item_assignees (
+  id         TEXT PRIMARY KEY,
+  item_id    TEXT NOT NULL REFERENCES items(id),
+  member     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_assignees_unique ON item_assignees(item_id, member) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_item_assignees_member ON item_assignees(member);
+
+CREATE TABLE IF NOT EXISTS item_watchers (
+  id         TEXT PRIMARY KEY,
+  item_id    TEXT NOT NULL REFERENCES items(id),
+  member     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_watchers_unique ON item_watchers(item_id, member) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_item_watchers_member ON item_watchers(member);
+
+CREATE TABLE IF NOT EXISTS project_watchers (
+  id         TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  member     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_watchers_unique ON project_watchers(project_id, member) WHERE deleted_at IS NULL;

@@ -39,7 +39,9 @@ type ItemFields struct {
 	Labels      *[]string // replaces the whole label set with exactly these (empty clears); not with Label
 	Component   *string
 	Status      *string
-	Assignee    *string
+	Assignee    *string   // replaces the whole assignee set with this one identity ("" clears)
+	Assignees   *[]string // replaces the whole assignee set with exactly these; not with Assignee
+	Watchers    *[]string // replaces the whole watcher set with exactly these
 	Priority    *int64
 	Type        *string // privileged: changes what a ticket is, after the fact
 }
@@ -58,7 +60,7 @@ type ItemUpdate struct {
 
 func (f ItemFields) empty() bool {
 	return f.Title == nil && f.Description == nil && f.Label == nil && f.Labels == nil && f.Component == nil &&
-		f.Status == nil && f.Assignee == nil && f.Priority == nil && f.Type == nil
+		f.Status == nil && f.Assignee == nil && f.Assignees == nil && f.Watchers == nil && f.Priority == nil && f.Type == nil
 }
 
 // UpdateItemFields applies an edit in one transaction. It writes only fields
@@ -77,6 +79,9 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	if u.Fields.Label != nil && u.Fields.Labels != nil {
 		return nil, errors.New("give label or labels, not both")
 	}
+	if u.Fields.Assignee != nil && u.Fields.Assignees != nil {
+		return nil, errors.New("give assignee or assignees, not both")
+	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
@@ -86,14 +91,14 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 
 	var current struct {
 		projectID, itemType, title, status, updatedAt string
-		description, component, assignee              sql.NullString
+		description, component                        sql.NullString
 		priority                                      sql.NullInt64
 		deletedAt                                     sql.NullString
 	}
 	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, component,
-		status, assignee, priority, updated_at, deleted_at FROM items WHERE id = ?`, id).
+		status, priority, updated_at, deleted_at FROM items WHERE id = ?`, id).
 		Scan(&current.projectID, &current.itemType, &current.title, &current.description,
-			&current.component, &current.status, &current.assignee, &current.priority, &current.updatedAt,
+			&current.component, &current.status, &current.priority, &current.updatedAt,
 			&current.deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, &lookupError{msg: fmt.Sprintf("item %q not found", id), kind: ErrNotFound}
@@ -199,9 +204,43 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 		set("status = ?", *f.Status)
 		entries = append(entries, entry{operation: "status_changed", detail: map[string]string{"from": current.status, "to": *f.Status}})
 	}
-	if f.Assignee != nil && *f.Assignee != current.assignee.String {
-		set("assignee = ?", nullIfEmpty(*f.Assignee))
-		entries = append(entries, entry{operation: "assigned", detail: map[string]string{"from": current.assignee.String, "to": *f.Assignee}})
+	// Assignees and watchers live in child tables. Assignee keeps its meaning:
+	// replace the whole set with this one identity ("" clears it).
+	peopleChanged := false
+	if f.Assignee != nil || f.Assignees != nil {
+		var want []string
+		var err error
+		if f.Assignee != nil && strings.TrimSpace(*f.Assignee) != "" {
+			want, err = normalizeIdentities(FieldAssignee, []string{*f.Assignee})
+		}
+		if f.Assignees != nil {
+			want, err = normalizeIdentities(FieldAssignee, *f.Assignees)
+		}
+		if err != nil {
+			return nil, err
+		}
+		changed, before, after, err := db.replacePeopleTx(ctx, tx, assigneeTable, id, want, nowUTC())
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			peopleChanged = true
+			entries = append(entries, entry{operation: "assigned", detail: map[string]string{"from": before, "to": after}})
+		}
+	}
+	if f.Watchers != nil {
+		want, err := normalizeIdentities(FieldWatcher, *f.Watchers)
+		if err != nil {
+			return nil, err
+		}
+		changed, before, after, err := db.replacePeopleTx(ctx, tx, watcherTable, id, want, nowUTC())
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			peopleChanged = true
+			fieldChanges["watchers"] = [2]string{before, after}
+		}
 	}
 	if f.Priority != nil && (!current.priority.Valid || *f.Priority != current.priority.Int64) {
 		set("priority = ?", *f.Priority)
@@ -221,7 +260,7 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	}
 
 	// Nothing actually differs: report the item as it is, and write nothing.
-	if len(setClauses) == 0 && !labelChanged {
+	if len(setClauses) == 0 && !labelChanged && !peopleChanged {
 		return db.GetItem(ctx, id)
 	}
 

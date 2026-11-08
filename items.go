@@ -35,10 +35,15 @@ type Item struct {
 	Status      string
 	// Label is a compatibility view of Labels: all of them, ", "-joined, NULL when
 	// there are none. Labels is the real value (item_labels); consumers should move to it.
-	Label     sql.NullString
-	Labels    []string
-	Priority  sql.NullInt64
+	Label    sql.NullString
+	Labels   []string
+	Priority sql.NullInt64
+	// Assignee is a compatibility view of Assignees: all of them, ", "-joined, NULL
+	// when there are none. Assignees and Watchers are the real values (item_assignees,
+	// item_watchers), as identities "kind:id".
 	Assignee  sql.NullString
+	Assignees []string
+	Watchers  []string
 	Component sql.NullString
 	// CreatedBy is who wrote the ticket (an actor "kind:id"): set once at creation,
 	// never changed. NULL when the writer was unknown. Owner is the accountable
@@ -70,12 +75,14 @@ type CreateItemParams struct {
 	Label       string   // shorthand for one initial label; not allowed together with Labels
 	Labels      []string // initial labels; duplicates (any case) collapse
 	Priority    *int
-	Assignee    string
+	Assignee    string   // shorthand for one assignee; not allowed together with Assignees
+	Assignees   []string // nil: the default (an agent creator is assigned); empty: nobody
+	Watchers    []string // nil: the default (an agent creator's project owners); empty: nobody
 	Component   string
 	Owner       string // a person "person:id"; default: the creator if a person, else the project's first owner
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, ` + labelsSelect + `, priority, assignee, component, created_by, owner, created_at, updated_at, deleted_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, ` + labelsSelect + `, priority, ` + assigneesSelect + `, ` + watchersSelect + `, component, created_by, owner, created_at, updated_at, deleted_at`
 
 // validateComponentTitle confirms title exactly matches some existing,
 // non-deleted type=component item, in any project -- component assignment
@@ -128,13 +135,19 @@ func validateComponentTitleUnique(ctx context.Context, tx *sql.Tx, projectID, ti
 
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
-	var labels sql.NullString
+	var labels, assignees, watchers sql.NullString
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &labels, &it.Priority, &it.Assignee, &it.Component, &it.CreatedBy, &it.Owner, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
+		&it.Status, &labels, &it.Priority, &assignees, &watchers, &it.Component, &it.CreatedBy, &it.Owner, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
 	if err != nil {
 		return nil, err
 	}
 	setItemLabels(&it, labels)
+	it.Assignees = splitPeople(assignees)
+	it.Watchers = splitPeople(watchers)
+	it.Assignee = sql.NullString{}
+	if len(it.Assignees) > 0 {
+		it.Assignee = sql.NullString{String: strings.Join(it.Assignees, ", "), Valid: true}
+	}
 	return &it, nil
 }
 
@@ -152,6 +165,9 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 	if !validStatuses[p.Status] {
 		return nil, &FieldError{Field: "status", Value: p.Status, Allowed: statuses}
+	}
+	if p.Assignee != "" && p.Assignees != nil {
+		return nil, errors.New("give assignee or assignees, not both")
 	}
 	if p.Label != "" && len(p.Labels) > 0 {
 		return nil, errors.New("give label or labels, not both")
@@ -211,10 +227,10 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, priority, assignee, component, created_by, owner, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, priority, component, created_by, owner, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		p.Status, priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), nullIfEmpty(creator.String()), owner, now, now,
+		p.Status, priority, nullIfEmpty(p.Component), nullIfEmpty(creator.String()), owner, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -228,6 +244,9 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 		if _, _, err := db.addLabelTx(ctx, tx, id, l, now); err != nil {
 			return nil, err
 		}
+	}
+	if err := db.createPeopleTx(ctx, tx, id, p.ProjectID, p, creator, now); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -325,6 +344,7 @@ type ItemFilter struct {
 	TopLevelOnly bool
 	Assignee     string
 	Component    string
+	Watcher      string // an identity, compared case-insensitively
 	Owner        string // an identity, compared case-insensitively
 	CreatedBy    string
 }
@@ -352,8 +372,12 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 		args = append(args, f.Type)
 	}
 	if f.Assignee != "" {
-		q += ` AND assignee = ?`
-		args = append(args, f.Assignee)
+		q += ` AND EXISTS (SELECT 1 FROM item_assignees a WHERE a.item_id = items.id AND a.deleted_at IS NULL AND lower(a.member) = lower(?))`
+		args = append(args, strings.TrimSpace(f.Assignee))
+	}
+	if f.Watcher != "" {
+		q += ` AND EXISTS (SELECT 1 FROM item_watchers w WHERE w.item_id = items.id AND w.deleted_at IS NULL AND lower(w.member) = lower(?))`
+		args = append(args, strings.TrimSpace(f.Watcher))
 	}
 	if f.Component != "" {
 		q += ` AND component = ?`

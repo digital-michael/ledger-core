@@ -232,7 +232,7 @@ func TestGoldenPathEveryOperation(t *testing.T) {
 	if it, err := s.UpdateItemPriority(ctx, task.ID, 5); err != nil || it.Priority.Int64 != 5 {
 		t.Errorf("UpdateItemPriority: %v %v", it, err)
 	}
-	if it, err := s.UpdateItemAssignee(ctx, task.ID, "michael"); err != nil || it.Assignee.String != "michael" {
+	if it, err := s.UpdateItemAssignee(ctx, task.ID, "person:michael"); err != nil || it.Assignee.String != "person:michael" {
 		t.Errorf("UpdateItemAssignee: %v %v", it, err)
 	}
 
@@ -762,7 +762,7 @@ func TestDeletedItemIsReadOnlyUntilRestored(t *testing.T) {
 	wantErrContaining(t, err, want)
 	_, err = db.UpdateItemPriority(ctx, it.ID, 9)
 	wantErrContaining(t, err, want)
-	_, err = db.UpdateItemAssignee(ctx, it.ID, "someone")
+	_, err = db.UpdateItemAssignee(ctx, it.ID, "person:someone")
 	wantErrContaining(t, err, want)
 	bulk := db.BulkUpdateItemStatus(ctx, []string{it.ID}, "done")
 	if len(bulk) != 1 || bulk[0].Error == nil || !strings.Contains(bulk[0].Error.Error(), want) {
@@ -771,10 +771,12 @@ func TestDeletedItemIsReadOnlyUntilRestored(t *testing.T) {
 
 	// Nothing changed, and nothing was audited as if it had.
 	var title, status string
-	var priority, assignee sql.NullString
-	db.conn.QueryRow(`SELECT title, status, priority, assignee FROM items WHERE id = ?`, it.ID).Scan(&title, &status, &priority, &assignee)
-	if title != "to be deleted" || status != "backlog" || priority.Valid || assignee.Valid {
-		t.Errorf("deleted item was modified: title=%q status=%q priority=%v assignee=%v", title, status, priority, assignee)
+	var priority sql.NullString
+	db.conn.QueryRow(`SELECT title, status, priority FROM items WHERE id = ?`, it.ID).Scan(&title, &status, &priority)
+	var assignees int
+	db.conn.QueryRow(`SELECT COUNT(*) FROM item_assignees WHERE item_id = ?`, it.ID).Scan(&assignees)
+	if title != "to be deleted" || status != "backlog" || priority.Valid || assignees != 0 {
+		t.Errorf("deleted item was modified: title=%q status=%q priority=%v assignees=%d", title, status, priority, assignees)
 	}
 	if n := len(auditRows(t, db, "item", it.ID)); n != auditBefore {
 		t.Errorf("refused edits wrote %d audit row(s)", n-auditBefore)
@@ -1348,13 +1350,13 @@ func TestUpdateItemFields(t *testing.T) {
 	// A save touching three kinds of field: one call, one transaction.
 	three := int64(3)
 	got, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{
-		Title: ptr("after"), Status: ptr("in_progress"), Priority: &three, Assignee: ptr("michael"),
+		Title: ptr("after"), Status: ptr("in_progress"), Priority: &three, Assignee: ptr("person:michael"),
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Title != "after" || got.Status != "in_progress" || got.Priority.Int64 != 3 ||
-		got.Assignee.String != "michael" || got.Description.String != "desc" {
+		got.Assignee.String != "person:michael" || got.Description.String != "desc" {
 		t.Errorf("after the save: %+v", got)
 	}
 
