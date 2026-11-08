@@ -18,6 +18,7 @@ var deletableTables = map[string]string{
 	"resource":      "resources",
 	"note":          "notes",
 	"item_relation": "item_relations",
+	"item_label":    "item_labels",
 	// Workflows (2026-09-29). workflow_versions is deliberately absent: a
 	// version is history, not an entity to remove.
 	"workflow":             "workflows",

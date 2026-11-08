@@ -33,12 +33,15 @@ type Item struct {
 	Title       string
 	Description sql.NullString
 	Status      string
-	Label       sql.NullString
-	Priority    sql.NullInt64
-	Assignee    sql.NullString
-	Component   sql.NullString
-	CreatedAt   string
-	UpdatedAt   string
+	// Label is a compatibility view of Labels: all of them, ", "-joined, NULL when
+	// there are none. Labels is the real value (item_labels); consumers should move to it.
+	Label     sql.NullString
+	Labels    []string
+	Priority  sql.NullInt64
+	Assignee  sql.NullString
+	Component sql.NullString
+	CreatedAt string
+	UpdatedAt string
 	// DeletedAt is set when the item is soft-deleted. List and search
 	// queries already exclude deleted items, so in practice only GetItem --
 	// which deliberately still returns them, for inspection before a restore
@@ -59,13 +62,14 @@ type CreateItemParams struct {
 	Title       string
 	Description string
 	Status      string
-	Label       string
+	Label       string   // shorthand for one initial label; not allowed together with Labels
+	Labels      []string // initial labels; duplicates (any case) collapse
 	Priority    *int
 	Assignee    string
 	Component   string
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at, deleted_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, ` + labelsSelect + `, priority, assignee, component, created_at, updated_at, deleted_at`
 
 // validateComponentTitle confirms title exactly matches some existing,
 // non-deleted type=component item, in any project -- component assignment
@@ -118,11 +122,13 @@ func validateComponentTitleUnique(ctx context.Context, tx *sql.Tx, projectID, ti
 
 func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
+	var labels sql.NullString
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &it.Label, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
+		&it.Status, &labels, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
 	if err != nil {
 		return nil, err
 	}
+	setItemLabels(&it, labels)
 	return &it, nil
 }
 
@@ -140,6 +146,17 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 	if !validStatuses[p.Status] {
 		return nil, &FieldError{Field: "status", Value: p.Status, Allowed: statuses}
+	}
+	if p.Label != "" && len(p.Labels) > 0 {
+		return nil, errors.New("give label or labels, not both")
+	}
+	initial := p.Labels
+	if p.Label != "" {
+		initial = []string{p.Label}
+	}
+	initial, err := normalizeLabels(initial)
+	if err != nil {
+		return nil, err
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
@@ -174,10 +191,10 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, label, priority, assignee, component, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, priority, assignee, component, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		p.Status, nullIfEmpty(p.Label), priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), now, now,
+		p.Status, priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -186,6 +203,11 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	detail, _ := json.Marshal(map[string]string{"title": p.Title, "type": p.Type})
 	if err := db.insertAudit(ctx, tx, "item", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+	for _, l := range initial {
+		if _, _, err := db.addLabelTx(ctx, tx, id, l, now); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -300,8 +322,8 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 		args = append(args, f.Status)
 	}
 	if f.Label != "" {
-		q += ` AND label = ?`
-		args = append(args, f.Label)
+		q += ` AND EXISTS (SELECT 1 FROM item_labels l WHERE l.item_id = items.id AND l.deleted_at IS NULL AND lower(l.label) = lower(?))`
+		args = append(args, strings.TrimSpace(f.Label))
 	}
 	if f.Type != "" {
 		q += ` AND type = ?`

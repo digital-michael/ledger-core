@@ -82,13 +82,13 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 
 	var current struct {
 		projectID, itemType, title, status, updatedAt string
-		description, label, component, assignee       sql.NullString
+		description, component, assignee              sql.NullString
 		priority                                      sql.NullInt64
 		deletedAt                                     sql.NullString
 	}
-	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, label, component,
+	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, component,
 		status, assignee, priority, updated_at, deleted_at FROM items WHERE id = ?`, id).
-		Scan(&current.projectID, &current.itemType, &current.title, &current.description, &current.label,
+		Scan(&current.projectID, &current.itemType, &current.title, &current.description,
 			&current.component, &current.status, &current.assignee, &current.priority, &current.updatedAt,
 			&current.deletedAt)
 	if err == sql.ErrNoRows {
@@ -143,9 +143,26 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 		fieldChanges["description"] = [2]string{current.description.String, *f.Description}
 		set("description = ?", nullIfEmpty(*f.Description))
 	}
-	if f.Label != nil && *f.Label != current.label.String {
-		fieldChanges["label"] = [2]string{current.label.String, *f.Label}
-		set("label = ?", nullIfEmpty(*f.Label))
+	// Label keeps its meaning: replace the item's whole label set with this one
+	// value ("" clears all). The rows live in item_labels now.
+	labelChanged := false
+	if f.Label != nil {
+		var want []string
+		if strings.TrimSpace(*f.Label) != "" {
+			v, err := normalizeLabel(*f.Label)
+			if err != nil {
+				return nil, err
+			}
+			want = []string{v}
+		}
+		changed, before, after, err := db.replaceItemLabelsTx(ctx, tx, id, want, nowUTC())
+		if err != nil {
+			return nil, err
+		}
+		if changed {
+			labelChanged = true
+			fieldChanges["label"] = [2]string{before, after}
+		}
 	}
 	if f.Component != nil && *f.Component != current.component.String {
 		if *f.Component != "" {
@@ -194,7 +211,7 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	}
 
 	// Nothing actually differs: report the item as it is, and write nothing.
-	if len(setClauses) == 0 {
+	if len(setClauses) == 0 && !labelChanged {
 		return db.GetItem(ctx, id)
 	}
 

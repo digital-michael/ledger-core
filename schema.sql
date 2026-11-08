@@ -189,3 +189,24 @@ CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project_id);
 CREATE INDEX IF NOT EXISTS idx_relations_from ON item_relations(from_item_id);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON item_relations(to_item_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
+
+-- Labels (2026-11-07, ledger item 20a5d442): zero or more free-form tags per
+-- item, replacing the single items.label column. Existing items.label values
+-- are copied here once by store.go's migrateItemLabels(); the old column is
+-- left in place as the safety copy until a gated step drops it.
+--
+-- Unique per item, case-insensitive, over live rows only: a removed
+-- (soft-deleted) label does not block adding the same label again. The label is
+-- stored trimmed; lower() is SQLite's ASCII folding, which is what the tools
+-- compare with too.
+CREATE TABLE IF NOT EXISTS item_labels (
+  id         TEXT PRIMARY KEY,
+  item_id    TEXT NOT NULL REFERENCES items(id),
+  label      TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_item_labels_unique ON item_labels(item_id, lower(label)) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_item_labels_item ON item_labels(item_id);
+CREATE INDEX IF NOT EXISTS idx_item_labels_label ON item_labels(lower(label));

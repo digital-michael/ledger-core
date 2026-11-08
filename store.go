@@ -72,6 +72,14 @@ type Store interface {
 	UpdateItemPriority(ctx context.Context, id string, priority int) (*Item, error)
 	UpdateItemAssignee(ctx context.Context, id, assignee string) (*Item, error)
 
+	// Labels (labels.go): zero or more per item, unique per item
+	AddLabel(ctx context.Context, itemID, label string) (*ItemLabel, bool, error)
+	RemoveLabel(ctx context.Context, itemID, label string) (bool, error)
+	ListLabels(ctx context.Context, itemID string) ([]ItemLabel, error)
+	ListDistinctLabels(ctx context.Context, projectIDs []string) ([]LabelCount, error)
+	ReplaceLabels(ctx context.Context, existing, newLabel string) (int, error)
+	LabelMigrationReport(ctx context.Context) (*LabelGateReport, error)
+
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
 	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
@@ -368,6 +376,15 @@ func open(opts Options) (*DB, error) {
 	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component)`); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating component index: %w", err)
+	}
+
+	// Labels: copy any legacy items.label value that has no item_labels row yet.
+	// Idempotent, and it never resurrects a label removed since the first copy.
+	if n, err := migrateItemLabels(context.Background(), conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("copying labels to item_labels: %w", err)
+	} else if n > 0 {
+		fmt.Fprintf(os.Stderr, "ledger: copied %d existing item labels to item_labels\n", n)
 	}
 
 	// Last, after every migration: the triggers reference columns that the
