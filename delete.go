@@ -42,17 +42,19 @@ func (db *DB) SoftDelete(ctx context.Context, entityType, id string) error {
 	if err := db.permitDelete(ctx, entityType, id, OpDeleteProject, OpDeleteOthersNote); err != nil {
 		return err
 	}
-	if entityType == "project_member" {
-		if err := db.refuseLastOwnerRow(ctx, id); err != nil {
-			return err
-		}
-	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Checked inside the transaction, with the project locked: two owners deleted at
+	// the same moment must not each see the other still there.
+	if entityType == "project_member" {
+		if err := refuseLastOwnerRow(ctx, tx, id); err != nil {
+			return err
+		}
+	}
 
 	now := nowUTC()
 	res, err := tx.ExecContext(ctx,

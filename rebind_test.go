@@ -72,6 +72,36 @@ func TestPostgresSQL_spellsTheSQLiteIdioms(t *testing.T) {
 	}
 }
 
+func TestPostgresSQL_likeKeepsSQLitesCaseInsensitivity(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"WHERE title LIKE ? ESCAPE '\\'", "WHERE title ILIKE $1 ESCAPE '\\'"},
+		{"WHERE name NOT LIKE 'x%'", "WHERE name NOT ILIKE 'x%'"},
+		{"WHERE id like ? || '%'", "WHERE id ILIKE $1 || '%'"},
+		{"WHERE title ILIKE ?", "WHERE title ILIKE $1"},                      // already spelled for Postgres
+		{"SELECT 'LIKE ?', ?", "SELECT 'LIKE ?', $1"},                        // inside a literal: untouched
+		{"SELECT dislike, unliked FROM t", "SELECT dislike, unliked FROM t"}, // a longer word: untouched
+	}
+	for _, c := range cases {
+		if got := postgresSQL(c.in); got != c.want {
+			t.Errorf("postgresSQL(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestPostgresSQL_lockDirective(t *testing.T) {
+	in := "SELECT deleted_at FROM items WHERE id = ? " + lockDirective
+	if got := postgresSQL(in); got != "SELECT deleted_at FROM items WHERE id = $1 FOR UPDATE" {
+		t.Errorf("got %q", got)
+	}
+	// For SQLite the directive is only a comment: the statement is valid as written.
+	db := openTest(t)
+	p := mustProject(t, db, "lock")
+	var d sql.NullString
+	if err := db.conn.QueryRow("SELECT deleted_at FROM projects WHERE id = ? "+lockDirective, p.ID).Scan(&d); err != nil && !onPostgres() {
+		t.Errorf("the directive broke the statement on SQLite: %v", err)
+	}
+}
+
 // Every query the real itemColumns builds survives translation with the right
 // number of parameters and no stray SQLite spelling.
 func TestPostgresSQL_itemColumnsHaveNoSQLiteSpelling(t *testing.T) {

@@ -3,8 +3,12 @@ package ledgercore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // nowUTC returns the current time as a fixed-width UTC stamp (see stamps.go), the
@@ -58,7 +62,9 @@ func refuseIfDeleted(ctx context.Context, tx *sql.Tx, entityType, table, id stri
 		return nil
 	}
 	var deletedAt sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM `+table+` WHERE id = ?`, id).Scan(&deletedAt)
+	// The row is locked for the rest of the transaction (see lockDirective): whatever
+	// the caller does next, it does to an entity nobody else can change meanwhile.
+	err := tx.QueryRowContext(ctx, `SELECT deleted_at FROM `+table+` WHERE id = ? `+lockDirective, id).Scan(&deletedAt)
 	if err == sql.ErrNoRows {
 		return nil
 	}
@@ -78,4 +84,25 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
+}
+
+// boolInt is a flag as the INTEGER column that stores it. SQLite quietly turns a Go
+// bool into 0 or 1; PostgreSQL's driver refuses to, and a column that means the same
+// thing in both databases should not depend on which was lenient.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// isUniqueViolation reports whether err is a unique-constraint failure from either
+// database: a lost race to create the same row, which callers often treat as "it is
+// already there".
+func isUniqueViolation(err error) bool {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) {
+		return pg.Code == "23505"
+	}
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }

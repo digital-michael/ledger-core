@@ -36,10 +36,18 @@ func (db *DB) RelateItems(ctx context.Context, fromID, toID, relationType string
 	// Either end: a new relation changes both items' relation sets. Existing
 	// relations are untouched by a delete (no cascade) and can still be
 	// soft-deleted themselves, which is how leftovers get cleaned up.
-	if err := refuseIfItemDeleted(ctx, tx, fromID); err != nil {
+	//
+	// Both items are locked (see lockDirective), always in id order: two people
+	// relating the same pair in opposite directions would otherwise each hold one lock
+	// and wait for the other.
+	first, second := fromID, toID
+	if second < first {
+		first, second = second, first
+	}
+	if err := refuseIfItemDeleted(ctx, tx, first); err != nil {
 		return nil, err
 	}
-	if err := refuseIfItemDeleted(ctx, tx, toID); err != nil {
+	if err := refuseIfItemDeleted(ctx, tx, second); err != nil {
 		return nil, err
 	}
 

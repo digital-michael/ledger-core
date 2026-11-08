@@ -1,7 +1,7 @@
 # ledger-core
 
-The ledger's persistence layer: one SQLite-backed implementation of every ledger read and write,
-shared by every program that touches the ledger database.
+The ledger's persistence layer: one implementation of every ledger read and write, over SQLite or
+PostgreSQL, shared by every program that touches the ledger database.
 
 ## Purpose
 
@@ -33,14 +33,14 @@ here.
 - **No authentication and no user registry.** It checks that an identity is well formed, not that
   the person exists.
 - **No notification delivery.** Watchers are stored; nothing is sent.
-- **No external synchronisation, and no database other than SQLite today.**
+- **No external synchronisation, and no database other than SQLite and PostgreSQL.**
 
 ## Boundaries
 
 | | |
 |---|---|
 | Owns | The ledger schema and its migrations; every read and write of ledger data; the vocabulary and the storage triggers that enforce it; the identity format; the audit trail |
-| Depends on | `modernc.org/sqlite` (a pure Go SQLite driver) and `github.com/google/uuid` |
+| Depends on | `modernc.org/sqlite` (a pure Go SQLite driver), `github.com/jackc/pgx/v5` (a pure Go PostgreSQL driver) and `github.com/google/uuid` |
 | Used by | `mcp-local`, through a thin adapter that supplies the calling MCP client's name; `ledger-server`, the web UI |
 
 ## Layout
@@ -48,6 +48,7 @@ here.
 | Path | What |
 |---|---|
 | `store.go` | `Open`, `Options`, the `Store` contract, and the migrations that run on open |
+| `dialect.go`, `postgres.go`, `rebind.go` | What differs between the two databases: introspection, insert-or-ignore, triggers, the schema script; the PostgreSQL open; the driver wrapper that translates the shared SQL for PostgreSQL |
 | `schema.sql` | The schema, embedded in the binary |
 | `items.go`, `edit.go`, `move.go` | Work items: create, list, edit as one transaction with an optional conflict check, move between projects |
 | `labels.go`, `assignees.go` | Labels, assignees and watchers: child lists, unique per live member, with their one-time copies of the old single-value columns |
@@ -65,9 +66,15 @@ here.
 ## Build and test
 
 ```
-go test ./...          # full suite, including the multi-process concurrency regression test
-go test -short ./...   # skip the test that spawns child processes
+make test              # vet and the whole suite against SQLite (seconds)
+make test-pg           # the same suite against a throwaway PostgreSQL in Podman, then remove it
+go test -short ./...   # skip the tests that spawn child processes
 ```
+
+`make test-pg` starts PostgreSQL 17 on loopback with its data in memory. By hand, set
+`LEDGERCORE_TEST_PG` to a `postgres://` URL and run `go test .`: each test ledger gets its own
+schema and the schema is dropped afterwards. Tests that are about SQLite itself (an older
+release's columns, pragmas, a file on disk) skip themselves on PostgreSQL.
 
 The tests open real SQLite databases in temp directories through the public `Open()`. The
 concurrency test re-executes the test binary as five separate writer processes, because SQLite's
@@ -86,6 +93,7 @@ import ledgercore "github.com/digital-michael/ledger-core"
 
 store, err := ledgercore.Open(ledgercore.Options{
     // Path: "" means DefaultPath(): LEDGER_DB_PATH, else ~/.local/share/mcp-local/ledger.db
+    // DSN: "postgres://user:pass@host/db" opens PostgreSQL instead, and Path is ignored.
     Actor: func(ctx context.Context) ledgercore.Actor {
         return ledgercore.Actor{Kind: ledgercore.ActorProgram, ID: "my-program"} // recorded on every audit row
     },
@@ -120,6 +128,22 @@ These hold because something went wrong once. Do not change them casually.
   Opening the ledger copies each old value into its table only for records that have no row yet, so
   a removal is never undone. The drop command refuses unless every old value is represented.
 - **Every stamp is fixed-width UTC** (`2006-01-02T15:04:05.000000000Z`, 30 characters), written only through `FormatStamp`. Sorting stamps as text is then sorting them by time, which every `ORDER BY` and every `created_at >= ?` relies on. `time.RFC3339Nano` trims trailing zeros, so `…:00.5Z` sorted before `…:00Z` although it is later. A test checks every `*_at` column of every table after every kind of write.
+- **The SQL is written once.** A statement is never copied per database. The PostgreSQL driver is
+  wrapped so that `?` placeholders become `$1, $2, ...`, `group_concat(x, char(31))` becomes
+  `string_agg(x, chr(31))` and `LIKE` becomes `ILIKE` (SQLite's `LIKE` ignores case; every search
+  here promises to). What cannot be translated lives behind the dialect in `dialect.go`.
+- **A check that decides a write is made under a row lock.** SQLite takes its write lock when a write
+  transaction begins, so "read, check, then write" is safe there. PostgreSQL reads committed data
+  by default, so two writers can both pass a check. A SELECT that ends in the `/*+ lock */`
+  comment becomes `FOR UPDATE` on PostgreSQL and is plain SQL on SQLite. `refuseIfDeleted` and the
+  edit read use it, which covers the edit conflict check, the last-owner rule, timer pairing, and
+  adding a label, assignee, watcher or member twice. Two entities are locked in id order. Race
+  tests hold both backends to the same answers.
+- **Initialisation is serialised.** Several programs opening a new or out-of-date ledger together
+  take turns (a PostgreSQL advisory lock named for the schema), and the column migrations treat
+  "someone else just added it" as success.
+- **A stamp column is byte-ordered on PostgreSQL** (`COLLATE "C"`), so comparing two stamps does not
+  depend on the server's locale.
 - **The last owner of a project cannot be removed or demoted**, including through the generic soft
   delete.
 

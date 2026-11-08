@@ -150,8 +150,13 @@ type Factory interface {
 
 // Options configures Open.
 type Options struct {
-	// Path is the SQLite file to open. Empty means DefaultPath().
+	// Path is the SQLite file to open. Empty means DefaultPath(). Ignored when DSN is set.
 	Path string
+
+	// DSN, when set, opens a PostgreSQL ledger instead of a SQLite file: a
+	// postgres:// URL (or a key=value connection string). The same schema and the same
+	// rules apply; see postgres.go.
+	DSN string
 
 	// Actor names whoever is performing a mutation. It is called once per
 	// audit row, with the context of the call that caused it -- so a caller
@@ -215,6 +220,9 @@ func Open(opts Options) (Store, error) {
 // open resolves the database path, ensures its parent directory exists,
 // opens the connection, locks down file permissions, and applies the schema.
 func open(opts Options) (*DB, error) {
+	if opts.DSN != "" {
+		return openPostgres(opts)
+	}
 	path := opts.Path
 	if path == "" {
 		p, err := DefaultPath()
@@ -314,13 +322,34 @@ func open(opts Options) (*DB, error) {
 		fmt.Fprintf(os.Stderr, "ledger: journal_mode is %q, not WAL; concurrent writes will be slower\n", journalMode)
 	}
 
+	return initialize(conn, opts)
+}
+
+// initialize applies the schema and every migration to a freshly connected
+// database, whichever kind it is, and returns the ready ledger. It closes conn on
+// failure. The whole of it runs under the dialect's initialisation lock, so several
+// programs opening a new or out-of-date ledger together take turns.
+func initialize(conn *dbConn, opts Options) (*DB, error) {
+	release, err := conn.d.lockInit(context.Background(), conn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := initializeLocked(conn, opts)
+	release()
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+// initializeLocked is initialize's body. It does not close conn: the lock's own
+// connection is still out of the pool while it runs.
+func initializeLocked(conn *dbConn, opts Options) (*DB, error) {
 	schema, err := schemaFS.ReadFile("schema.sql")
 	if err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("reading embedded schema: %w", err)
 	}
-	if _, err := conn.Exec(string(schema)); err != nil {
-		conn.Close()
+	if err := conn.d.applySchema(context.Background(), conn, string(schema)); err != nil {
 		return nil, fmt.Errorf("applying schema: %w", err)
 	}
 
@@ -328,22 +357,18 @@ func open(opts Options) (*DB, error) {
 	// a database created before deleted_at existed needs it added explicitly.
 	for _, table := range []string{"projects", "items", "resources", "notes", "item_relations"} {
 		if err := ensureColumn(conn, table, "deleted_at", "TEXT"); err != nil {
-			conn.Close()
 			return nil, err
 		}
 	}
 	if err := ensureColumn(conn, "audit_log", "client", "TEXT"); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	// Project workflows (2026-09-30). Existing workflows become 0: none was
 	// created as a project workflow, so nothing is guessed.
 	if err := ensureColumn(conn, "workflows", "project_level", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	if err := ensureColumn(conn, "resources", "updated_at", "TEXT"); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	// Who did it, and whether it was part of one bulk action. Added
@@ -356,7 +381,6 @@ func open(opts Options) (*DB, error) {
 		{"notes", "author_label"},
 	} {
 		if err := ensureColumn(conn, c.table, c.column, "TEXT"); err != nil {
-			conn.Close()
 			return nil, err
 		}
 	}
@@ -368,15 +392,12 @@ func open(opts Options) (*DB, error) {
 	// adding the new one. Both drop steps are no-ops on a database that
 	// never had the old shape, including a brand-new one.
 	if _, err := conn.Exec(`DROP INDEX IF EXISTS idx_items_component`); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("dropping stale component index: %w", err)
 	}
 	if err := ensureColumnDropped(conn, "items", "component_id"); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	if err := ensureColumn(conn, "items", "component", "TEXT"); err != nil {
-		conn.Close()
 		return nil, err
 	}
 	// Created here, after the migration above guarantees the column exists,
@@ -384,7 +405,6 @@ func open(opts Options) (*DB, error) {
 	// these ensureColumn migrations run, so an index on a migrated-in column
 	// would fail with "no such column" on any database that predates it.
 	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component)`); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("creating component index: %w", err)
 	}
 
@@ -395,19 +415,16 @@ func open(opts Options) (*DB, error) {
 		{"items", "created_by"}, {"items", "owner"}, {"projects", "created_by"},
 	} {
 		if err := ensureColumn(conn, c.table, c.column, "TEXT"); err != nil {
-			conn.Close()
 			return nil, err
 		}
 	}
 	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_owner ON items(owner)`); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("creating owner index: %w", err)
 	}
 
 	// Labels: copy any legacy items.label value that has no item_labels row yet.
 	// Idempotent, and it never resurrects a label removed since the first copy.
 	if n, err := migrateItemLabels(context.Background(), conn); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("copying labels to item_labels: %w", err)
 	} else if n > 0 {
 		fmt.Fprintf(os.Stderr, "ledger: copied %d existing item labels to item_labels\n", n)
@@ -417,7 +434,6 @@ func open(opts Options) (*DB, error) {
 	// row yet. Idempotent; a value it cannot map to an identity is left alone and
 	// reported by AssigneeMigrationReport, which blocks the drop.
 	if n, err := migrateItemAssignees(context.Background(), conn); err != nil {
-		conn.Close()
 		return nil, fmt.Errorf("copying assignees to item_assignees: %w", err)
 	} else if n > 0 {
 		fmt.Fprintf(os.Stderr, "ledger: copied %d existing item assignees to item_assignees\n", n)
@@ -426,7 +442,6 @@ func open(opts Options) (*DB, error) {
 	// Last, after every migration: the triggers reference columns that the
 	// migrations above may have just added.
 	if err := conn.d.ensureVocab(context.Background(), conn); err != nil {
-		conn.Close()
 		return nil, err
 	}
 
@@ -446,7 +461,12 @@ func ensureColumn(conn *dbConn, table, column, columnType string) error {
 	if has {
 		return nil // already present
 	}
-	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType)); err != nil {
+	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, conn.d.columnDef(column, columnType))); err != nil {
+		// Another program opening the same ledger at the same moment may have added it
+		// between the check and here. The column being there is what was wanted.
+		if now, herr := hasColumn(conn, table, column); herr == nil && now {
+			return nil
+		}
 		return fmt.Errorf("adding column %s.%s: %w", table, column, err)
 	}
 	return nil
@@ -477,6 +497,10 @@ func ensureColumnDropped(conn *dbConn, table, column string) error {
 		return err
 	}
 	if _, err := conn.Exec(fmt.Sprintf("ALTER TABLE %s DROP COLUMN %s", table, column)); err != nil {
+		// Lost a race to another opener that dropped it first: it is gone, as wanted.
+		if now, herr := hasColumn(conn, table, column); herr == nil && !now {
+			return nil
+		}
 		return fmt.Errorf("dropping column %s.%s: %w", table, column, err)
 	}
 	return nil

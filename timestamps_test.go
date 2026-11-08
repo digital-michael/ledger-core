@@ -59,52 +59,28 @@ func TestStamp_fixedWidthAndSortsLikeTime(t *testing.T) {
 }
 
 // timestampSweep returns every non-null value of every column named *_at, in any
-// table, that is not a fixed-width stamp. It uses its own PRAGMA scan, not the
-// package's, so a table the package forgot is still found.
+// table, that is not a fixed-width stamp. It discovers tables from the database, so a
+// table added later is checked without being listed.
 func timestampSweep(t *testing.T, db *DB) []string {
 	t.Helper()
 	var bad []string
-	tables, err := db.conn.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	cols, err := timestampColumns(ctx, db.conn.d, db.conn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var names []string
-	for tables.Next() {
-		var n string
-		tables.Scan(&n)
-		names = append(names, n)
-	}
-	tables.Close()
-	for _, tb := range names {
-		cols, err := db.conn.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tb))
+	for _, c := range cols {
+		rows, err := db.conn.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE %s IS NOT NULL`, c.column, c.table, c.column))
 		if err != nil {
 			t.Fatal(err)
 		}
-		var stampCols []string
-		for cols.Next() {
-			var cid, notnull, pk int
-			var name, ctype string
-			var dflt sql.NullString
-			cols.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk)
-			if strings.HasSuffix(name, "_at") {
-				stampCols = append(stampCols, name)
+		for rows.Next() {
+			var v string
+			rows.Scan(&v)
+			if !stampRE.MatchString(v) {
+				bad = append(bad, fmt.Sprintf("%s.%s = %q", c.table, c.column, v))
 			}
 		}
-		cols.Close()
-		for _, c := range stampCols {
-			rows, err := db.conn.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE %s IS NOT NULL`, c, tb, c))
-			if err != nil {
-				t.Fatal(err)
-			}
-			for rows.Next() {
-				var v string
-				rows.Scan(&v)
-				if !stampRE.MatchString(v) {
-					bad = append(bad, fmt.Sprintf("%s.%s = %q", tb, c, v))
-				}
-			}
-			rows.Close()
-		}
+		rows.Close()
 	}
 	return bad
 }
@@ -216,7 +192,7 @@ func TestStamp_normalizeRewritesEveryLegacyShape(t *testing.T) {
 		db.conn.Exec(`UPDATE items SET created_at = ?, updated_at = ? WHERE id = ?`, v, v, id)
 	}
 	db.conn.Exec(`UPDATE notes SET created_at = '2026-01-01T00:00:00.123Z', updated_at = '2026-01-01T05:00:00+05:00' WHERE id = ?`, n.ID)
-	db.conn.Exec(`UPDATE audit_log SET created_at = '2026-01-01T00:00:00.000000001Z' WHERE rowid = (SELECT MIN(rowid) FROM audit_log)`)
+	db.conn.Exec(`UPDATE audit_log SET created_at = '2026-01-01T00:00:00.000000001Z' WHERE id = (SELECT id FROM audit_log ORDER BY created_at LIMIT 1)`)
 	db.conn.Exec(`UPDATE items SET deleted_at = '2026-01-02T00:00:00.25Z' WHERE id = ?`, b.ID)
 
 	// The bug, shown on real rows: text order and time order disagree.
@@ -319,41 +295,28 @@ func TestStamp_normalizeOnAFreshLedgerIsANoOp(t *testing.T) {
 	}
 }
 
-// snapshotStamps maps "table.column.rowid" to its value for every *_at value.
+// snapshotStamps maps "table.column.key" to its value for every *_at value, keyed by
+// each table's primary key.
 func snapshotStamps(t *testing.T, db *DB) map[string]string {
 	t.Helper()
 	out := map[string]string{}
-	tables, _ := db.conn.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
-	var names []string
-	for tables.Next() {
-		var n string
-		tables.Scan(&n)
-		names = append(names, n)
+	cols, err := timestampColumns(ctx, db.conn.d, db.conn)
+	if err != nil {
+		t.Fatal(err)
 	}
-	tables.Close()
-	for _, tb := range names {
-		cols, _ := db.conn.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tb))
-		var cc []string
-		for cols.Next() {
-			var cid, notnull, pk int
-			var name, ctype string
-			var dflt sql.NullString
-			cols.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk)
-			if strings.HasSuffix(name, "_at") {
-				cc = append(cc, name)
-			}
+	for _, c := range cols {
+		rows, err := db.conn.Query(fmt.Sprintf(`SELECT %s, %s FROM %s WHERE %s IS NOT NULL`, c.pk, c.column, c.table, c.column))
+		if err != nil {
+			t.Fatal(err)
 		}
-		cols.Close()
-		for _, c := range cc {
-			rows, _ := db.conn.Query(fmt.Sprintf(`SELECT rowid, %s FROM %s WHERE %s IS NOT NULL`, c, tb, c))
-			for rows.Next() {
-				var id int64
-				var v string
-				rows.Scan(&id, &v)
-				out[fmt.Sprintf("%s.%s.%d", tb, c, id)] = v
+		for rows.Next() {
+			var key, v string
+			if err := rows.Scan(&key, &v); err != nil {
+				t.Fatal(err)
 			}
-			rows.Close()
+			out[c.table+"."+c.column+"."+key] = v
 		}
+		rows.Close()
 	}
 	return out
 }

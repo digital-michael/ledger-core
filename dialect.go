@@ -31,6 +31,18 @@ type dialect interface {
 
 	// ensureVocab installs the triggers that enforce the vocabulary (enforce.go).
 	ensureVocab(ctx context.Context, c *dbConn) error
+
+	// lockInit serialises initialisation (schema, migrations, triggers) across the
+	// programs opening the same ledger at once, and returns the function that
+	// releases it. SQLite's own locking already does this.
+	lockInit(ctx context.Context, c *dbConn) (release func(), err error)
+
+	// applySchema runs schema.sql, which is written once for both databases.
+	applySchema(ctx context.Context, c *dbConn, schema string) error
+	// columnDef is the definition of a column added to an existing table. A stamp
+	// column (*_at) is declared byte-ordered where the database would otherwise
+	// sort by locale.
+	columnDef(column, typ string) string
 }
 
 // querier is what both *sql.DB and *sql.Tx offer for a read.
@@ -120,6 +132,15 @@ func (sqliteDialect) insertIgnore(table string, columns ...string) string {
 }
 
 func (sqliteDialect) ensureVocab(_ context.Context, c *dbConn) error { return ensureVocabTriggers(c) }
+
+func (sqliteDialect) lockInit(context.Context, *dbConn) (func(), error) { return func() {}, nil }
+
+func (sqliteDialect) applySchema(ctx context.Context, c *dbConn, schema string) error {
+	_, err := c.ExecContext(ctx, schema)
+	return err
+}
+
+func (sqliteDialect) columnDef(_, typ string) string { return typ }
 
 // placeholders returns "?, ?, ?" for n parameters.
 func placeholders(n int) string {

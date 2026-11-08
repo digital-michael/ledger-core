@@ -96,7 +96,7 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 		deletedAt                                     sql.NullString
 	}
 	err = tx.QueryRowContext(ctx, `SELECT project_id, type, title, description, component,
-		status, priority, updated_at, deleted_at FROM items WHERE id = ?`, id).
+		status, priority, updated_at, deleted_at FROM items WHERE id = ? `+lockDirective, id).
 		Scan(&current.projectID, &current.itemType, &current.title, &current.description,
 			&current.component, &current.status, &current.priority, &current.updatedAt,
 			&current.deletedAt)

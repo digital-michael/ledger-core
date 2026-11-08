@@ -18,8 +18,9 @@ import (
 //
 //   - "?" becomes "$1", "$2", ... in order, but never inside quoted text, a quoted
 //     identifier, a comment, or a dollar-quoted body;
-//   - the two idioms this package repeats, group_concat(x, char(31)) and nothing
-//     else, are spelled the PostgreSQL way (string_agg(x, chr(31))).
+//   - the SQLite idioms this package repeats are spelled the PostgreSQL way:
+//     group_concat(x, char(31)) becomes string_agg(x, chr(31)), and LIKE (which
+//     ignores case in SQLite) becomes ILIKE.
 //
 // Anything that differs structurally (listing tables, triggers, upserts) is not
 // rewritten here: it lives behind the dialect seam in dialect.go.
@@ -128,14 +129,27 @@ func rebind(q string) string {
 var (
 	groupConcatRE = regexp.MustCompile(`(?i)\bgroup_concat\s*\(`)
 	char31RE      = regexp.MustCompile(`(?i)\bchar\(31\)`)
+	likeRE        = regexp.MustCompile(`(?i)\bLIKE\b`)
 )
 
-// postgresSQL is the whole translation for the PostgreSQL driver: the spellings,
-// then the placeholders.
+// lockDirective, written at the end of a SELECT, asks for the row to be locked until
+// the transaction ends. It is a comment, so SQLite ignores it: SQLite takes its write
+// lock when a write transaction begins (_txlock=immediate), which already makes "read,
+// check, then write" safe. PostgreSQL reads committed data by default, so two writers
+// can both pass a check; there the directive becomes FOR UPDATE and the second writer
+// waits for the first, then sees what it did.
+const lockDirective = "/*+ lock */"
+
+// postgresSQL is the whole translation for the PostgreSQL driver: the lock
+// directive, the spellings, then the placeholders.
 func postgresSQL(q string) string {
+	q = strings.ReplaceAll(q, lockDirective, "FOR UPDATE")
 	spelled := rewriteCode(q, func(code string) string {
 		code = groupConcatRE.ReplaceAllString(code, "string_agg(")
-		return char31RE.ReplaceAllString(code, "chr(31)")
+		code = char31RE.ReplaceAllString(code, "chr(31)")
+		// SQLite's LIKE ignores case (for ASCII); PostgreSQL's does not. Every search
+		// in this package promises a case-insensitive match, so it is spelled ILIKE.
+		return likeRE.ReplaceAllString(code, "ILIKE")
 	})
 	return rebind(spelled)
 }

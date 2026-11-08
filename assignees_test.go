@@ -468,11 +468,7 @@ func TestAssignees_dropAfterCopyKeepsEverythingWorking(t *testing.T) {
 	if has, _ := hasColumn(db.conn, "items", "assignee"); has {
 		t.Error("reopening recreated items.assignee")
 	}
-	var integrity string
-	db.conn.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
-	if integrity != "ok" {
-		t.Errorf("integrity_check = %s", integrity)
-	}
+	assertIntegrity(t, db)
 }
 
 func TestAssignees_aFreshDatabaseHasNoLegacyColumn(t *testing.T) {

@@ -6,11 +6,15 @@ import (
 	"testing"
 )
 
-func TestSQLiteDialect_introspection(t *testing.T) {
+func TestDialect_introspection(t *testing.T) {
 	db := openTest(t)
 	d := db.conn.d
-	if d.name() != "sqlite" {
-		t.Fatalf("name = %q", d.name())
+	want := "sqlite"
+	if onPostgres() {
+		want = "postgres"
+	}
+	if d.name() != want {
+		t.Fatalf("name = %q, want %q", d.name(), want)
 	}
 	tables, err := d.tables(ctx, db.conn)
 	if err != nil {
@@ -22,7 +26,7 @@ func TestSQLiteDialect_introspection(t *testing.T) {
 			if n == want {
 				found = true
 			}
-			if strings.HasPrefix(n, "sqlite_") {
+			if strings.HasPrefix(n, "sqlite_") || strings.HasPrefix(n, "pg_") {
 				t.Errorf("the database's own table %q is listed", n)
 			}
 		}
@@ -72,6 +76,7 @@ func TestPrimaryKey_refusesNoneAndComposite(t *testing.T) {
 }
 
 func TestSQLiteDialect_statements(t *testing.T) {
+	skipOnPostgres(t, "asserts the SQLite spellings of the statements")
 	d := sqliteDialect{}
 	if got := d.insertIgnore("t", "a", "b", "c"); got != "INSERT OR IGNORE INTO t (a, b, c) VALUES (?, ?, ?)" {
 		t.Errorf("insertIgnore: %q", got)

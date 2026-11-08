@@ -76,7 +76,7 @@ func (db *DB) GetOrCreateProject(ctx context.Context, key, name string) (*Projec
 	if err != sql.ErrNoRows {
 		return nil, fmt.Errorf("looking up project %q: %w", key, err)
 	}
-	return db.insertProject(ctx, key, name)
+	return db.createOrFind(ctx, key, name, false)
 }
 
 // GetOrCreateProjectForWrite is GetOrCreateProject's stricter counterpart,
@@ -100,7 +100,26 @@ func (db *DB) GetOrCreateProjectForWrite(ctx context.Context, key, name string) 
 	if err != sql.ErrNoRows {
 		return nil, fmt.Errorf("looking up project %q: %w", key, err)
 	}
-	return db.insertProject(ctx, key, name)
+	return db.createOrFind(ctx, key, name, true)
+}
+
+// createOrFind creates the project, or -- if another program created the same key
+// between the lookup and the insert -- returns theirs. Several programs writing to a
+// project key that does not exist yet is the normal first-use case, and the loser of
+// that race should end up in the same project, not with an error.
+func (db *DB) createOrFind(ctx context.Context, key, name string, forWrite bool) (*Project, error) {
+	p, err := db.insertProject(ctx, key, name)
+	if err == nil || !isUniqueViolation(err) {
+		return p, err
+	}
+	found, deletedAt, ferr := findProject(ctx, db.conn, key)
+	if ferr != nil {
+		return nil, err // not a lost race after all: report the original error
+	}
+	if forWrite && deletedAt.Valid {
+		return nil, &ErrProjectSoftDeleted{Key: found.Key, ID: found.ID}
+	}
+	return &found, nil
 }
 
 // insertProject creates a project row and records its creation in

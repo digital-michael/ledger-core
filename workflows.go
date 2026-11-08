@@ -141,7 +141,7 @@ func (db *DB) CreateWorkflow(ctx context.Context, p CreateWorkflowParams) (*Work
 	by := nullIfEmpty(db.currentActor(ctx).String())
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO workflows (id, project_id, status, current_version, project_level, created_by, created_at, updated_at)
-		 VALUES (?, ?, ?, 1, ?, ?, ?, ?)`, id, p.ProjectID, status, p.ProjectLevel, by, now, now); err != nil {
+		 VALUES (?, ?, ?, 1, ?, ?, ?, ?)`, id, p.ProjectID, status, boolInt(p.ProjectLevel), by, now, now); err != nil {
 		return nil, fmt.Errorf("inserting workflow: %w", err)
 	}
 	if err := insertVersion(ctx, tx, id, 1, &doc, p.ChangeNote, by, now); err != nil {
@@ -274,7 +274,7 @@ func (db *DB) SetWorkflowProjectLevel(ctx context.Context, id string, projectLev
 		return nil, err
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE workflows SET project_level = ?, updated_at = ? WHERE id = ? AND project_level <> ?`,
-		projectLevel, nowUTC(), resolved, projectLevel)
+		boolInt(projectLevel), nowUTC(), resolved, boolInt(projectLevel))
 	if err != nil {
 		return nil, fmt.Errorf("updating workflow: %w", err)
 	}

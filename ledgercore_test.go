@@ -41,7 +41,9 @@ func ptr(s string) *string { return &s }
 
 func openAt(t *testing.T, path string) *DB {
 	t.Helper()
-	s, err := Open(Options{Path: path, Actor: func(context.Context) Actor { return Actor{Kind: ActorProgram, ID: testClient, Label: testClient} }})
+	opts := backendOptions(t, path)
+	opts.Actor = func(context.Context) Actor { return Actor{Kind: ActorProgram, ID: testClient, Label: testClient} }
+	s, err := Open(opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -76,7 +78,7 @@ func mustItem(t *testing.T, db *DB, projectID, title string) *Item {
 func auditRows(t *testing.T, db *DB, entityType, id string) []AuditEntry {
 	t.Helper()
 	rows, err := db.conn.Query(`SELECT id, entity_type, entity_id, operation, detail, created_at, client, actor, batch
-		FROM audit_log WHERE entity_type = ? AND entity_id = ? ORDER BY rowid`, entityType, id)
+		FROM audit_log WHERE entity_type = ? AND entity_id = ? ORDER BY created_at`, entityType, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +133,7 @@ func TestDefaultPathResolution(t *testing.T) {
 // applied to every pooled connection, not just whichever one served a single
 // Exec. Holding three connections at once forces three distinct ones.
 func TestOpenConfiguresEveryPooledConnection(t *testing.T) {
+	skipOnPostgres(t, "checks SQLite pragmas on each pooled connection")
 	db := openTest(t)
 	var conns []*sql.Conn
 	for i := 0; i < 3; i++ {
@@ -350,7 +353,7 @@ func TestGoldenPathEveryOperation(t *testing.T) {
 }
 
 func TestAuditClientIsNullWithoutResolver(t *testing.T) {
-	s, err := Open(Options{Path: filepath.Join(t.TempDir(), "ledger.db")})
+	s, err := Open(backendOptions(t, filepath.Join(t.TempDir(), "ledger.db")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,9 +448,7 @@ func TestTriggersSparePreexistingRows(t *testing.T) {
 
 	// Recreate the real situation: a bad row written before the triggers
 	// existed.
-	if _, err := db.conn.Exec(`DROP TRIGGER ` + relationTriggerName("ins")); err != nil {
-		t.Fatal(err)
-	}
+	dropTrigger(t, db, relationTriggerName("ins"), "item_relations")
 	if _, err := db.conn.Exec(`INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at) VALUES ('legacy', ?, ?, 'blocks', ?)`,
 		a.ID, b.ID, nowUTC()); err != nil {
 		t.Fatal(err)
@@ -455,9 +456,7 @@ func TestTriggersSparePreexistingRows(t *testing.T) {
 
 	// Reopen: the missing trigger is reinstalled.
 	db2 := openAt(t, path)
-	var n int
-	db2.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name = ?`, relationTriggerName("ins")).Scan(&n)
-	if n != 1 {
+	if !triggerExists(t, db2, relationTriggerName("ins")) {
 		t.Fatalf("relation insert trigger not reinstalled on reopen")
 	}
 
@@ -490,19 +489,14 @@ func TestStaleVocabularyTriggerIsReplaced(t *testing.T) {
 	db := openTest(t)
 	p := mustProject(t, db, "zeta")
 	stale := "ledger_vocab_items_status_ins_deadbeef"
-	if _, err := db.conn.Exec(`CREATE TRIGGER ` + stale + ` BEFORE INSERT ON items WHEN NEW.status NOT IN ('backlog')
-		BEGIN SELECT RAISE(ABORT, 'stale vocabulary'); END`); err != nil {
-		t.Fatal(err)
-	}
+	createStaleTrigger(t, db, stale)
 	_, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Status: "done"})
 	wantErrContaining(t, err, "stale vocabulary")
 
-	if err := ensureVocabTriggers(db.conn); err != nil {
+	if err := db.conn.d.ensureVocab(ctx, db.conn); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	db.conn.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name = ?`, stale).Scan(&n)
-	if n != 0 {
+	if triggerExists(t, db, stale) {
 		t.Errorf("stale trigger %s was not dropped", stale)
 	}
 	if _, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "x", Status: "done"}); err != nil {
@@ -605,6 +599,7 @@ func TestUpdateResource(t *testing.T) {
 // open, and its existing rows are left NULL -- not backfilled. Adding a column
 // must not rewrite data.
 func TestResourcesUpdatedAtMigration(t *testing.T) {
+	skipOnPostgres(t, "builds a legacy SQLite file by hand")
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -667,6 +662,7 @@ func TestConcurrentWritersAcrossProcesses(t *testing.T) {
 		cmd.Env = append(os.Environ(),
 			"LEDGERCORE_WRITER=w"+strconv.Itoa(i),
 			"LEDGERCORE_PATH="+path,
+			"LEDGERCORE_DSN="+backendOptions(t, path).DSN,
 			"LEDGERCORE_PROJECT="+p.ID,
 			"LEDGERCORE_N="+strconv.Itoa(perProc),
 		)
@@ -700,7 +696,7 @@ func runWriter() int {
 	worker := os.Getenv("LEDGERCORE_WRITER")
 	path, project := os.Getenv("LEDGERCORE_PATH"), os.Getenv("LEDGERCORE_PROJECT")
 	n, _ := strconv.Atoi(os.Getenv("LEDGERCORE_N"))
-	opts := Options{Path: path, Actor: func(context.Context) Actor {
+	opts := Options{Path: path, DSN: os.Getenv("LEDGERCORE_DSN"), Actor: func(context.Context) Actor {
 		return Actor{Kind: ActorProgram, ID: "writer/" + worker, Label: "writer/" + worker}
 	}}
 
@@ -1057,14 +1053,12 @@ func TestHealthFindings(t *testing.T) {
 	}
 	// 5. An off-vocabulary value from before enforcement: drop the trigger,
 	//    write one, and put the trigger back.
-	if _, err := db.conn.Exec(`DROP TRIGGER ` + relationTriggerName("ins")); err != nil {
-		t.Fatal(err)
-	}
+	dropTrigger(t, db, relationTriggerName("ins"), "item_relations")
 	if _, err := db.conn.Exec(`INSERT INTO item_relations (id, from_item_id, to_item_id, relation_type, created_at)
 		VALUES ('legacy', ?, ?, 'serves', ?)`, keeper.ID, child.ID, nowUTC()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureVocabTriggers(db.conn); err != nil {
+	if err := db.conn.d.ensureVocab(ctx, db.conn); err != nil {
 		t.Fatal(err)
 	}
 	// 6. A timer nobody stopped.
@@ -1148,11 +1142,10 @@ func TestHealthFindings(t *testing.T) {
 
 func openAs(t *testing.T, path string, actor Actor, permit func(context.Context, Actor, Operation, Target) error) *DB {
 	t.Helper()
-	s, err := Open(Options{
-		Path:   path,
-		Actor:  func(context.Context) Actor { return actor },
-		Permit: permit,
-	})
+	opts := backendOptions(t, path)
+	opts.Actor = func(context.Context) Actor { return actor }
+	opts.Permit = permit
+	s, err := Open(opts)
 	if err != nil {
 		t.Fatal(err)
 	}

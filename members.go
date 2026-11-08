@@ -252,21 +252,26 @@ func (db *DB) ListProjectMembers(ctx context.Context, projectID string) ([]Proje
 	return out, rows.Err()
 }
 
-// refuseLastOwnerRow stops the generic soft delete from removing a project's
-// last owner, which RemoveProjectMember already refuses.
-func (db *DB) refuseLastOwnerRow(ctx context.Context, rowID string) error {
+// refuseLastOwnerRow stops the generic soft delete from removing a project's last
+// owner, which RemoveProjectMember already refuses. It runs in the delete's own
+// transaction and locks the project first, so the count it makes is not stale by the
+// time the delete happens.
+func refuseLastOwnerRow(ctx context.Context, tx *sql.Tx, rowID string) error {
 	var projectID, role string
 	var deleted sql.NullString
-	err := db.conn.QueryRowContext(ctx, `SELECT project_id, role, deleted_at FROM project_members WHERE id = ?`, rowID).Scan(&projectID, &role, &deleted)
+	err := tx.QueryRowContext(ctx, `SELECT project_id, role, deleted_at FROM project_members WHERE id = ?`, rowID).Scan(&projectID, &role, &deleted)
 	if err == sql.ErrNoRows || deleted.Valid || role != "owner" {
 		return nil // not found / already gone / not an owner: the caller's own handling speaks
 	}
 	if err != nil {
 		return err
 	}
-	var n int
-	if err := db.conn.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM project_members WHERE project_id = ? AND role = 'owner' AND deleted_at IS NULL AND id <> ?`, projectID, rowID).Scan(&n); err != nil {
+	var locked string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM projects WHERE id = ? `+lockDirective, projectID).Scan(&locked); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	n, err := liveOwnerCount(ctx, tx, projectID, rowID)
+	if err != nil {
 		return err
 	}
 	if n == 0 {

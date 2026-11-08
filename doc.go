@@ -1,5 +1,5 @@
-// Package ledgercore is the ledger's persistence layer: one SQLite-backed
-// implementation of every ledger read and write.
+// Package ledgercore is the ledger's persistence layer: one implementation of
+// every ledger read and write, over SQLite or PostgreSQL.
 //
 // It stores projects, work items (with labels, assignees, watchers, an owner and
 // a creator), project members, resources, notes and timers, item relations,
@@ -29,15 +29,15 @@
 //   - No authentication and no user registry. It checks that an identity is
 //     well formed, not that the person exists.
 //   - No notification delivery. Watchers are stored; nothing is sent.
-//   - No external synchronisation, and no database other than SQLite today.
+//   - No external synchronisation, and no database other than SQLite and PostgreSQL.
 //
 // # Boundaries
 //
 // Owns: the ledger schema and its migrations; every read and write of ledger
 // data; the vocabulary and the storage triggers that enforce it; the identity
 // format; the audit trail.
-// Depends on: modernc.org/sqlite (a pure Go SQLite driver) and
-// github.com/google/uuid.
+// Depends on: modernc.org/sqlite and github.com/jackc/pgx/v5 (pure Go SQLite and
+// PostgreSQL drivers) and github.com/google/uuid.
 // Used by: mcp-local (through a thin adapter that supplies the calling MCP
 // client's name) and ledger-server (the web UI).
 package ledgercore

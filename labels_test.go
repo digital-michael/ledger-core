@@ -674,9 +674,5 @@ func TestLabels_dropAfterCopyKeepsEverythingWorking(t *testing.T) {
 	if got := labelsOf(t, db, ids[2]); !reflect.DeepEqual(got, []string{"gamma"}) {
 		t.Errorf("after reopen: %v", got)
 	}
-	var integrity string
-	db.conn.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
-	if integrity != "ok" {
-		t.Errorf("integrity_check = %s", integrity)
-	}
+	assertIntegrity(t, db)
 }
