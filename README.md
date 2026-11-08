@@ -62,6 +62,8 @@ here.
 | `cmd/backfill-people` | One-off: fill creator and owner on records that predate those fields |
 | `cmd/drop-legacy-label`, `cmd/drop-legacy-assignee` | One-off, gated: remove an old column after the zero-loss check passes |
 | `cmd/fix-timestamps` | One-off: rewrite old variable-width stamps into the fixed-width form, all or nothing |
+| `copy.go`, `cmd/copy-ledger` | Copy whole projects (or everything, or the projects of a plan or workflow) between ledgers, SQLite to PostgreSQL or back: id-preserving, idempotent, all or nothing, with a dry run, an outside-link decision, row-for-row verification and a reported skip of leaf rows left over from before the vocabulary rules |
+| `scripts/` | `smoke-copy.sh`: rehearses the copy on a snapshot of the real ledger and a throwaway PostgreSQL |
 
 ## Build and test
 
@@ -69,6 +71,7 @@ here.
 make test              # vet and the whole suite against SQLite (seconds)
 make test-pg           # the same suite against a throwaway PostgreSQL in Podman, then remove it
 go test -short ./...   # skip the tests that spawn child processes
+bash scripts/smoke-copy.sh   # copy a snapshot of the real ledger into a throwaway PostgreSQL and verify it (SMOKE_ALL=1: every live project)
 ```
 
 `make test-pg` starts PostgreSQL 17 on loopback with its data in memory. By hand, set
