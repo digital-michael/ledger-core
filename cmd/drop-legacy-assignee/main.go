@@ -1,5 +1,5 @@
-// drop-legacy-assignee removes the old items.assignee column once every assignee
-// is safely in item_assignees (ledger story 13ed93aa).
+// Usage notes for drop-legacy-assignee: removes the old items.assignee column once every assignee
+// is safely in item_assignees.
 //
 // Without -apply it only prints the zero-loss check and changes nothing. With
 // -apply it drops the column, and only if the check passes. A legacy value that
@@ -9,6 +9,7 @@
 //
 //	go run ./cmd/drop-legacy-assignee -db /path/to/ledger.db            # check only
 //	go run ./cmd/drop-legacy-assignee -db /path/to/ledger.db -apply     # check, then drop
+
 package main
 
 import (

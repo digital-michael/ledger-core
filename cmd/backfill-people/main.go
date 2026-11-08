@@ -1,6 +1,5 @@
-// backfill-people fills created_by and owner on the ledger's existing items and
-// projects, and gives every project without one a first owner (ledger story
-// a94140e8).
+// Usage notes for backfill-people: fills created_by and owner on the ledger's existing items and
+// projects, and gives every project without one a first owner.
 //
 // created_by comes from the first "created" audit row of each item or project
 // (see ledgercore.CreatorFromAudit for the mapping); owner is the person given
@@ -11,6 +10,7 @@
 //
 //	go run ./cmd/backfill-people -db /path/to/ledger.db -owner person:digital-michael           # report
 //	go run ./cmd/backfill-people -db /path/to/ledger.db -owner person:digital-michael -apply    # do it
+
 package main
 
 import (

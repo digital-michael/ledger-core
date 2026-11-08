@@ -191,7 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_relations_from ON item_relations(from_item_id);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON item_relations(to_item_id);
 CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_log(entity_type, entity_id);
 
--- Labels (2026-11-07, ledger item 20a5d442): zero or more free-form tags per
+-- Labels (2026-11-07): zero or more free-form tags per
 -- item, replacing the single items.label column. Existing items.label values
 -- are copied here once by store.go's migrateItemLabels(); the old column is
 -- left in place as the safety copy until a gated step drops it.
@@ -212,7 +212,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_item_labels_unique ON item_labels(item_id,
 CREATE INDEX IF NOT EXISTS idx_item_labels_item ON item_labels(item_id);
 CREATE INDEX IF NOT EXISTS idx_item_labels_label ON item_labels(lower(label));
 
--- Project members (2026-11-07, ledger story a94140e8): who may work in a project
+-- Project members (2026-11-07): who may work in a project
 -- and in what role. There is no single owner column on projects; ownership is the
 -- owner role here, so a project can have several owners. member is an identity
 -- "kind:id" (identity.go). Unique per project among live rows, so a removed
@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS project_members (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_project_members_unique ON project_members(project_id, member) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_project_members_member ON project_members(member);
 
--- Assignees and watchers (2026-11-07, ledger story 13ed93aa): the same shape as
+-- Assignees and watchers (2026-11-07): the same shape as
 -- item_labels. member is an identity "kind:id" (identity.go). Unique per owner
 -- among live rows, so a removed member can be added again. item_assignees
 -- replaces the single items.assignee column, which is no longer created here: a

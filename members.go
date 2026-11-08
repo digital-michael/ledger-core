@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Project members (ledger story a94140e8, decided 2026-11-07).
+// Project members (decided 2026-11-07).
 //
 // A project has no single "owner" column: ownership and access live here, so
 // there can be several owners. Each live row is one person or agent with a

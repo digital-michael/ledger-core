@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Who made a ticket and who is accountable for it (ledger story a94140e8).
+// Who made a ticket and who is accountable for it.
 //
 //   - created_by is who actually wrote it: the writer's actor string, set once at
 //     creation and never changed by any operation. Unknown is NULL, not a guess.

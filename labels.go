@@ -14,7 +14,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Labels: zero or more free-form tags per item (ledger item 20a5d442).
+// Labels: zero or more free-form tags per item.
 //
 // item_labels replaces the single items.label column. The rules, decided with
 // the operator 2026-11-07:

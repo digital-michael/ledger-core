@@ -259,7 +259,7 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 // resolveItemID resolves id to an exact item id: an exact match first, then
 // a unique-prefix match if no exact match exists -- mirrors git's short-hash
 // resolution, since ids are commonly truncated in conversation/doc
-// references (e.g. "ticket 37f26083") but ledger_get_item historically
+// references (e.g. "ticket 1a2b3c4d") but ledger_get_item historically
 // required the full UUID. Errors clearly, listing every candidate, if the
 // prefix matches more than one item rather than silently picking one.
 // Deliberately does not filter deleted_at -- matches GetItem's own existing

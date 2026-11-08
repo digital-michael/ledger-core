@@ -5,8 +5,7 @@ import (
 	"strings"
 )
 
-// Identity format for every people field (decided 2026-11-07, ledger-server
-// ownership story a94140e8).
+// Identity format for every people field (decided 2026-11-07).
 //
 // A person, agent or program is written as the "kind:id" string that
 // audit_log.actor and notes.author already hold -- "person:digital-michael",

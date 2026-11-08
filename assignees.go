@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// Assignees and watchers (ledger story 13ed93aa, decided 2026-11-07).
+// Assignees and watchers (decided 2026-11-07).
 //
 // Three child tables of one shape -- item_assignees, item_watchers,
 // project_watchers -- the same pattern as labels: a row per member, unique per

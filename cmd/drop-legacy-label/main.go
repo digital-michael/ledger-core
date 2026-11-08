@@ -1,5 +1,5 @@
-// drop-legacy-label removes the old items.label column once every label is
-// safely in item_labels (ledger item 20a5d442, stage 2c).
+// Usage notes for drop-legacy-label: removes the old items.label column once every label is
+// safely in item_labels.
 //
 // Without -apply it only prints the zero-loss check and changes nothing. With
 // -apply it drops the column, and only if the check passes. Take a backup
@@ -7,6 +7,7 @@
 //
 //	go run ./cmd/drop-legacy-label -db /path/to/ledger.db            # check only
 //	go run ./cmd/drop-legacy-label -db /path/to/ledger.db -apply     # check, then drop
+
 package main
 
 import (

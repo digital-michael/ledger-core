@@ -19,7 +19,7 @@ func nowUTC() string {
 // they accept. Before 2026-09-10 the item update functions checked nothing,
 // so a deleted item -- hidden from every list and summary -- kept accepting
 // status, priority, assignee and field changes, and came back from a restore
-// with edits nobody saw happen (defect b1c028d7). The message names the exact
+// with edits nobody saw happen. The message names the exact
 // command that fixes it rather than failing opaquely.
 func errDeleted(entityType, id string) error {
 	// lookupError keeps the message exactly as it reads today (mcp-local

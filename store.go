@@ -1,16 +1,3 @@
-// Package ledgercore is the ledger's persistence layer: the Store contract
-// plus its only implementation today, a SQLite-backed DB. Typed query
-// functions for projects, items, resources, notes, item_relations, and
-// audit_log are defined against *DB throughout this package.
-//
-// It is the single implementation of every ledger write -- validation,
-// audit-in-transaction, soft delete, id-prefix resolution -- shared by every
-// program that writes the ledger: mcp-local's MCP tools and ledger-server's
-// web UI. It was extracted from mcp-local/internal/store/ledger on
-// 2026-09-10 precisely so those two front doors could not drift apart.
-//
-// It deliberately knows nothing about any caller's transport. Who performed
-// a mutation is supplied by the caller through Options.Client.
 package ledgercore
 
 import (
