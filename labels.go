@@ -449,6 +449,9 @@ func (db *DB) replaceItemLabelsTx(ctx context.Context, tx *sql.Tx, itemID string
 // open, and the copy is safe to run on every open. items.label is not touched.
 // It returns how many labels were copied.
 func migrateItemLabels(ctx context.Context, conn *sql.DB) (int, error) {
+	if has, err := hasColumn(conn, "items", "label"); err != nil || !has {
+		return 0, err // nothing to copy: the column is gone (dropped, or a new database)
+	}
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -515,6 +518,11 @@ func (r LabelGateReport) OK() bool {
 // LabelMigrationReport counts, per project, legacy labels against the items
 // that carry them in item_labels. It only reads.
 func (db *DB) LabelMigrationReport(ctx context.Context) (*LabelGateReport, error) {
+	if has, err := hasColumn(db.conn, "items", "label"); err != nil {
+		return nil, err
+	} else if !has {
+		return &LabelGateReport{}, nil // no legacy column, so no legacy label can be missing
+	}
 	rows, err := db.conn.QueryContext(ctx,
 		`SELECT p.key, COUNT(*),
 		        SUM(CASE WHEN EXISTS (SELECT 1 FROM item_labels l WHERE l.item_id = i.id) THEN 1 ELSE 0 END)
@@ -536,4 +544,38 @@ func (db *DB) LabelMigrationReport(ctx context.Context) (*LabelGateReport, error
 		rep.Copied += p.Copied
 	}
 	return rep, rows.Err()
+}
+
+// DropLegacyLabelColumn removes items.label, the column item_labels replaced.
+// It is the one irreversible step of the label migration, so it is gated: it
+// refuses unless LabelMigrationReport passes, meaning every item that has a
+// legacy label is represented in item_labels. dropped is false when the column
+// was already gone, so running it twice is harmless.
+//
+// Nothing may be reading the column when it goes: an older program that still
+// selects items.label fails loudly afterwards ("no such column"), which is why
+// every program that opens the ledger must be on the release that uses
+// item_labels first. Take a backup before calling it.
+func (db *DB) DropLegacyLabelColumn(ctx context.Context) (dropped bool, err error) {
+	has, err := hasColumn(db.conn, "items", "label")
+	if err != nil || !has {
+		return false, err
+	}
+	rep, err := db.LabelMigrationReport(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !rep.OK() {
+		var bad []string
+		for _, p := range rep.Projects {
+			if p.Copied != p.Legacy {
+				bad = append(bad, fmt.Sprintf("%s: %d legacy labels, %d in item_labels", p.Project, p.Legacy, p.Copied))
+			}
+		}
+		return false, fmt.Errorf("refusing to drop items.label: the zero-loss check failed (%s)", strings.Join(bad, "; "))
+	}
+	if err := ensureColumnDropped(db.conn, "items", "label"); err != nil {
+		return false, err
+	}
+	return true, nil
 }

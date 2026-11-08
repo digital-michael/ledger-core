@@ -34,10 +34,9 @@ func TestLabels_createWithSingularAndPluralAndCompat(t *testing.T) {
 	if !reflect.DeepEqual(one.Labels, []string{"core"}) || one.Label.String != "core" {
 		t.Errorf("single: Labels=%v Label=%q", one.Labels, one.Label.String)
 	}
-	// The legacy column is not written by new code; it remains the safety copy.
-	var legacy *string
-	if err := db.conn.QueryRow(`SELECT label FROM items WHERE id = ?`, one.ID).Scan(&legacy); err != nil || legacy != nil {
-		t.Errorf("items.label should stay NULL for new items: %v %v", legacy, err)
+	// A new database never has the legacy column at all.
+	if has, err := hasColumn(db.conn, "items", "label"); err != nil || has {
+		t.Errorf("a fresh database should have no items.label: has=%v err=%v", has, err)
 	}
 
 	many, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "many", Labels: []string{"b", "A", " a ", "c"}})
@@ -392,6 +391,7 @@ func TestLabels_softDeleteAndRestoreAsEntity(t *testing.T) {
 func TestLabels_migrationCopiesEveryLegacyLabelOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	db := openAt(t, path)
+	withLegacyLabelColumn(t, db)
 	p := mustProject(t, db, "lab")
 	var ids []string
 	legacy := []string{"alpha", "  padded  ", "Beta", ""}
@@ -469,6 +469,7 @@ func TestLabels_migrationCopiesEveryLegacyLabelOnce(t *testing.T) {
 func TestLabels_legacyCountHelperReportsMismatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.db")
 	db := openAt(t, path)
+	withLegacyLabelColumn(t, db)
 	p := mustProject(t, db, "lab")
 	a := mustItem(t, db, p.ID, "a")
 	mustItem(t, db, p.ID, "b")
@@ -556,5 +557,126 @@ func TestLabels_updateFieldsLabelsSetsTheExactList(t *testing.T) {
 	}
 	if got := labelsOf(t, db, it.ID); !reflect.DeepEqual(got, []string{"z"}) {
 		t.Errorf("combined edit: %v", got)
+	}
+}
+
+// withLegacyLabelColumn recreates the pre-migration shape for a test: an
+// items.label column an older release would have left behind.
+func withLegacyLabelColumn(t *testing.T, db *DB) {
+	t.Helper()
+	if err := ensureColumn(db.conn, "items", "label", "TEXT"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLabels_dropRefusesWhileAnyLegacyLabelIsMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	db := openAt(t, path)
+	withLegacyLabelColumn(t, db)
+	p := mustProject(t, db, "lab")
+	a := mustItem(t, db, p.ID, "a")
+	db.conn.Exec(`UPDATE items SET label = 'only-here' WHERE id = ?`, a.ID) // never copied
+
+	dropped, err := db.DropLegacyLabelColumn(ctx)
+	if err == nil || dropped {
+		t.Fatalf("the drop went ahead with a label missing: %v %v", dropped, err)
+	}
+	wantErrContaining(t, err, "zero-loss check failed")
+	wantErrContaining(t, err, "lab: 1 legacy labels, 0 in item_labels")
+	if has, _ := hasColumn(db.conn, "items", "label"); !has {
+		t.Error("a refused drop removed the column anyway")
+	}
+	var v string
+	db.conn.QueryRow(`SELECT label FROM items WHERE id = ?`, a.ID).Scan(&v)
+	if v != "only-here" {
+		t.Errorf("the legacy value was disturbed: %q", v)
+	}
+}
+
+func TestLabels_dropAfterCopyKeepsEverythingWorking(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	db := openAt(t, path)
+	withLegacyLabelColumn(t, db)
+	p := mustProject(t, db, "lab")
+	q := mustProject(t, db, "other")
+	var ids []string
+	for i, l := range []string{"alpha", "Beta", "gamma"} {
+		it := mustItem(t, db, map[bool]string{true: p.ID, false: q.ID}[i < 2], "item-"+l)
+		db.conn.Exec(`UPDATE items SET label = ? WHERE id = ?`, l, it.ID)
+		ids = append(ids, it.ID)
+	}
+	db.Close()
+
+	db = openAt(t, path) // the copy runs
+	rep, err := db.LabelMigrationReport(ctx)
+	if err != nil || !rep.OK() || rep.Legacy != 3 {
+		t.Fatalf("gate before the drop: %+v %v", rep, err)
+	}
+	dropped, err := db.DropLegacyLabelColumn(ctx)
+	if err != nil || !dropped {
+		t.Fatalf("drop: %v %v", dropped, err)
+	}
+	if has, _ := hasColumn(db.conn, "items", "label"); has {
+		t.Fatal("the column is still there")
+	}
+	// Idempotent.
+	if dropped, err := db.DropLegacyLabelColumn(ctx); err != nil || dropped {
+		t.Errorf("a second drop: %v %v", dropped, err)
+	}
+	if rep, err := db.LabelMigrationReport(ctx); err != nil || !rep.OK() || len(rep.Projects) != 0 {
+		t.Errorf("report after the drop: %+v %v", rep, err)
+	}
+
+	// Every label survived, and every operation still works without the column.
+	for i, want := range []string{"alpha", "Beta", "gamma"} {
+		if got := labelsOf(t, db, ids[i]); !reflect.DeepEqual(got, []string{want}) {
+			t.Errorf("item %d labels = %v, want %s", i, got, want)
+		}
+	}
+	it, err := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "after", Labels: []string{"x", "y"}})
+	if err != nil || len(it.Labels) != 2 {
+		t.Fatalf("create after the drop: %+v %v", it, err)
+	}
+	if _, err := db.UpdateItem(ctx, it.ID, UpdateItemParams{Label: ptr("z"), Title: ptr("renamed")}); err != nil {
+		t.Errorf("update after the drop: %v", err)
+	}
+	if got, _ := db.ListItems(ctx, ItemFilter{ProjectID: p.ID, Label: "alpha"}); len(got) != 1 {
+		t.Errorf("filter after the drop: %d", len(got))
+	}
+	if got, _ := db.FindItems(ctx, "", "item-"); len(got) != 3 {
+		t.Errorf("find after the drop: %d", len(got))
+	}
+	if _, _, err := db.AddLabel(ctx, ids[0], "more"); err != nil {
+		t.Errorf("add label after the drop: %v", err)
+	}
+	if n, err := db.ReplaceLabels(ctx, "alpha", "ALPHA2"); err != nil || n != 1 {
+		t.Errorf("replace after the drop: %d %v", n, err)
+	}
+	if _, err := db.MoveItem(ctx, ids[0], "other", MoveOptions{}); err != nil {
+		t.Errorf("move after the drop: %v", err)
+	}
+	if _, err := db.SearchItems(ctx, "", "item"); err != nil {
+		t.Errorf("search after the drop: %v", err)
+	}
+	if _, err := db.HealthFindings(ctx); err != nil {
+		t.Errorf("health after the drop: %v", err)
+	}
+	if _, err := db.SummarizeProject(ctx, p.ID, "lab"); err != nil {
+		t.Errorf("summary after the drop: %v", err)
+	}
+
+	// Reopening does not bring the column back, and nothing is copied again.
+	db.Close()
+	db = openAt(t, path)
+	if has, _ := hasColumn(db.conn, "items", "label"); has {
+		t.Error("reopening recreated items.label")
+	}
+	if got := labelsOf(t, db, ids[2]); !reflect.DeepEqual(got, []string{"gamma"}) {
+		t.Errorf("after reopen: %v", got)
+	}
+	var integrity string
+	db.conn.QueryRow(`PRAGMA integrity_check`).Scan(&integrity)
+	if integrity != "ok" {
+		t.Errorf("integrity_check = %s", integrity)
 	}
 }

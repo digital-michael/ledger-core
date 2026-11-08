@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS project_aliases (
 );
 CREATE INDEX IF NOT EXISTS idx_project_aliases_project ON project_aliases(project_id);
 
+-- The single items.label column was replaced by item_labels (below). It is no
+-- longer created here: a new database never has it, and an existing one keeps it
+-- only until DropLegacyLabelColumn removes it, after the zero-loss check.
 CREATE TABLE IF NOT EXISTS items (
   id          TEXT PRIMARY KEY,
   project_id  TEXT NOT NULL REFERENCES projects(id),
@@ -37,7 +40,6 @@ CREATE TABLE IF NOT EXISTS items (
   title       TEXT NOT NULL,
   description TEXT,
   status      TEXT NOT NULL,
-  label       TEXT,
   priority    INTEGER,
   order_key   INTEGER,
   assignee    TEXT,

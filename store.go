@@ -79,6 +79,7 @@ type Store interface {
 	ListDistinctLabels(ctx context.Context, projectIDs []string) ([]LabelCount, error)
 	ReplaceLabels(ctx context.Context, existing, newLabel string) (int, error)
 	LabelMigrationReport(ctx context.Context) (*LabelGateReport, error)
+	DropLegacyLabelColumn(ctx context.Context) (bool, error)
 
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
@@ -428,6 +429,27 @@ func ensureColumn(conn *sql.DB, table, column, columnType string) error {
 		return fmt.Errorf("adding column %s.%s: %w", table, column, err)
 	}
 	return nil
+}
+
+// hasColumn reports whether table has column, without changing anything.
+func hasColumn(conn *sql.DB, table, column string) (bool, error) {
+	rows, err := conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("inspecting %s schema: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // ensureColumnDropped is ensureColumn's inverse: removes column from table if
