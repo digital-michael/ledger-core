@@ -20,6 +20,7 @@ type Vocabulary struct {
 	NoteTypes         []string
 	WorkflowStatuses  []string
 	WorkflowLinkRoles []string
+	MemberRoles       []string
 }
 
 // Note types. Only NoteTypeComment is writable through AddNote; the two timer
@@ -70,6 +71,10 @@ var (
 	// it. Only implements counts toward covering a gap.
 	workflowLinkRoles = []string{"implements", "verifies"}
 
+	// memberRoles: what a person or agent may be in a project. Only a person can
+	// be an owner; the last owner cannot be removed (members.go).
+	memberRoles = []string{"owner", "member", "viewer"}
+
 	// workflowItemTypes: the item types a workflow can be associated with.
 	// Not a stored column, so no trigger -- checked on write only.
 	workflowItemTypes = []string{"epic", "story"}
@@ -87,6 +92,7 @@ var (
 	validWorkflowStatuses  = setOf(workflowStatuses)
 	validWorkflowLinkRoles = setOf(workflowLinkRoles)
 	validWorkflowItemTypes = setOf(workflowItemTypes)
+	validMemberRoles       = setOf(memberRoles)
 )
 
 // Vocab returns the ledger's vocabulary. Each call returns fresh slices, so
@@ -100,6 +106,7 @@ func Vocab() Vocabulary {
 
 		WorkflowStatuses:  append([]string(nil), workflowStatuses...),
 		WorkflowLinkRoles: append([]string(nil), workflowLinkRoles...),
+		MemberRoles:       append([]string(nil), memberRoles...),
 	}
 }
 

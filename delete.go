@@ -13,12 +13,13 @@ import (
 // SQL, but only ever from this fixed literal set, never from caller input
 // directly — an unrecognized entityType is rejected before reaching SQL.
 var deletableTables = map[string]string{
-	"project":       "projects",
-	"item":          "items",
-	"resource":      "resources",
-	"note":          "notes",
-	"item_relation": "item_relations",
-	"item_label":    "item_labels",
+	"project":        "projects",
+	"item":           "items",
+	"resource":       "resources",
+	"note":           "notes",
+	"item_relation":  "item_relations",
+	"item_label":     "item_labels",
+	"project_member": "project_members",
 	// Workflows (2026-09-29). workflow_versions is deliberately absent: a
 	// version is history, not an entity to remove.
 	"workflow":             "workflows",
@@ -37,6 +38,11 @@ func (db *DB) SoftDelete(ctx context.Context, entityType, id string) error {
 	}
 	if err := db.permitDelete(ctx, entityType, id, OpDeleteProject, OpDeleteOthersNote); err != nil {
 		return err
+	}
+	if entityType == "project_member" {
+		if err := db.refuseLastOwnerRow(ctx, id); err != nil {
+			return err
+		}
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)

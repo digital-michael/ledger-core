@@ -117,9 +117,10 @@ func (db *DB) insertProject(ctx context.Context, key, name string) (*Project, er
 
 	now := nowUTC()
 	id := uuid.NewString()
+	creator := db.currentActor(ctx)
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO projects (id, key, name, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		id, key, name, now, now,
+		`INSERT INTO projects (id, key, name, created_at, updated_at, created_by) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, key, name, now, now, nullIfEmpty(creator.String()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating project %q: %w", key, err)
@@ -128,6 +129,13 @@ func (db *DB) insertProject(ctx context.Context, key, name string) (*Project, er
 	detail, _ := json.Marshal(map[string]string{"key": key, "name": name})
 	if err := db.insertAudit(ctx, tx, "project", id, "created", string(detail)); err != nil {
 		return nil, fmt.Errorf("writing audit log: %w", err)
+	}
+	// A person who creates a project owns it. An agent or program is recorded as
+	// the creator and nothing more: accountability is a person's.
+	if who, perr := ParseIdentity(FieldOwner, creator.String()); perr == nil {
+		if _, _, err := db.addMemberTx(ctx, tx, id, who, "owner", now); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {

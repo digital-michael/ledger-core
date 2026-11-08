@@ -40,6 +40,11 @@ type Item struct {
 	Priority  sql.NullInt64
 	Assignee  sql.NullString
 	Component sql.NullString
+	// CreatedBy is who wrote the ticket (an actor "kind:id"): set once at creation,
+	// never changed. NULL when the writer was unknown. Owner is the accountable
+	// person, changed only by TransferItemOwner.
+	CreatedBy sql.NullString
+	Owner     sql.NullString
 	CreatedAt string
 	UpdatedAt string
 	// DeletedAt is set when the item is soft-deleted. List and search
@@ -67,9 +72,10 @@ type CreateItemParams struct {
 	Priority    *int
 	Assignee    string
 	Component   string
+	Owner       string // a person "person:id"; default: the creator if a person, else the project's first owner
 }
 
-const itemColumns = `id, project_id, parent_id, type, title, description, status, ` + labelsSelect + `, priority, assignee, component, created_at, updated_at, deleted_at`
+const itemColumns = `id, project_id, parent_id, type, title, description, status, ` + labelsSelect + `, priority, assignee, component, created_by, owner, created_at, updated_at, deleted_at`
 
 // validateComponentTitle confirms title exactly matches some existing,
 // non-deleted type=component item, in any project -- component assignment
@@ -124,7 +130,7 @@ func scanItem(row interface{ Scan(...any) error }) (*Item, error) {
 	var it Item
 	var labels sql.NullString
 	err := row.Scan(&it.ID, &it.ProjectID, &it.ParentID, &it.Type, &it.Title, &it.Description,
-		&it.Status, &labels, &it.Priority, &it.Assignee, &it.Component, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
+		&it.Status, &labels, &it.Priority, &it.Assignee, &it.Component, &it.CreatedBy, &it.Owner, &it.CreatedAt, &it.UpdatedAt, &it.DeletedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +189,20 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 		}
 	}
 
+	creator := db.currentActor(ctx)
+	var owner any
+	if p.Owner != "" {
+		o, err := ParseIdentity(FieldOwner, p.Owner)
+		if err != nil {
+			return nil, err
+		}
+		owner = o
+	} else if o, err := defaultOwnerTx(ctx, tx, p.ProjectID, creator); err != nil {
+		return nil, err
+	} else {
+		owner = o
+	}
+
 	id := uuid.NewString()
 	now := nowUTC()
 	var priority any
@@ -191,10 +211,10 @@ func (db *DB) CreateItem(ctx context.Context, p CreateItemParams) (*Item, error)
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, priority, assignee, component, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO items (id, project_id, parent_id, type, title, description, status, priority, assignee, component, created_by, owner, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, p.ProjectID, nullIfEmpty(p.ParentID), p.Type, p.Title, nullIfEmpty(p.Description),
-		p.Status, priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), now, now,
+		p.Status, priority, nullIfEmpty(p.Assignee), nullIfEmpty(p.Component), nullIfEmpty(creator.String()), owner, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting item: %w", err)
@@ -305,6 +325,8 @@ type ItemFilter struct {
 	TopLevelOnly bool
 	Assignee     string
 	Component    string
+	Owner        string // an identity, compared case-insensitively
+	CreatedBy    string
 }
 
 // ListItems returns items matching the given filters, ordered by creation
@@ -336,6 +358,14 @@ func (db *DB) ListItems(ctx context.Context, f ItemFilter) ([]Item, error) {
 	if f.Component != "" {
 		q += ` AND component = ?`
 		args = append(args, f.Component)
+	}
+	if f.Owner != "" {
+		q += ` AND lower(owner) = lower(?)`
+		args = append(args, strings.TrimSpace(f.Owner))
+	}
+	if f.CreatedBy != "" {
+		q += ` AND lower(created_by) = lower(?)`
+		args = append(args, strings.TrimSpace(f.CreatedBy))
 	}
 	switch {
 	case f.ParentID != "":

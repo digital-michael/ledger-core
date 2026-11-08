@@ -41,6 +41,7 @@ func vocabRules() []vocabRule {
 		{"notes", "type", noteTypes},
 		{"workflows", "status", workflowStatuses},
 		{"workflow_links", "role", workflowLinkRoles},
+		{"project_members", "role", memberRoles},
 	}
 }
 

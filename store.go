@@ -81,6 +81,15 @@ type Store interface {
 	LabelMigrationReport(ctx context.Context) (*LabelGateReport, error)
 	DropLegacyLabelColumn(ctx context.Context) (bool, error)
 
+	// People (people.go, members.go)
+	TransferItemOwner(ctx context.Context, itemID, newOwner string) (*Item, error)
+	ProjectCreatedBy(ctx context.Context, projectID string) (string, error)
+	AddProjectMember(ctx context.Context, projectID, member, role string) (*ProjectMember, bool, error)
+	RemoveProjectMember(ctx context.Context, projectID, member string) (bool, error)
+	SetProjectMemberRole(ctx context.Context, projectID, member, role string) (*ProjectMember, error)
+	ListProjectMembers(ctx context.Context, projectID string) ([]ProjectMember, error)
+	BackfillPeople(ctx context.Context, o BackfillOptions) (*BackfillReport, error)
+
 	// Resources
 	AddResource(ctx context.Context, projectID, itemID, url, label string) (*Resource, error)
 	ListResources(ctx context.Context, itemID, projectID string) ([]Resource, error)
@@ -377,6 +386,22 @@ func open(opts Options) (*DB, error) {
 	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_component ON items(component)`); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating component index: %w", err)
+	}
+
+	// People (2026-11-07): who created a ticket or project, and who owns a ticket.
+	// Added empty; a gated backfill fills them from the audit trail, because it
+	// involves judgment and so does not run on open.
+	for _, c := range []struct{ table, column string }{
+		{"items", "created_by"}, {"items", "owner"}, {"projects", "created_by"},
+	} {
+		if err := ensureColumn(conn, c.table, c.column, "TEXT"); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	if _, err := conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_owner ON items(owner)`); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("creating owner index: %w", err)
 	}
 
 	// Labels: copy any legacy items.label value that has no item_labels row yet.

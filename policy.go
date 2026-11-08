@@ -18,17 +18,19 @@ import "context"
 type Operation string
 
 const (
-	OpChangeItemType    Operation = "change_item_type"    // what a ticket is, after the fact
-	OpReparentItem      Operation = "reparent_item"       // restructures the hierarchy
-	OpRenameProject     Operation = "rename_project"      // changes how a project is shown everywhere
-	OpMoveItem          Operation = "move_item"           // takes tickets out of one project and into another
-	OpDeleteProject     Operation = "delete_project"      // affects every ticket in it
-	OpRestoreProject    Operation = "restore_project"     //
-	OpBulkUpdateStatus  Operation = "bulk_update_status"  // one action, many tickets
-	OpBulkRelate        Operation = "bulk_relate"         //
-	OpBulkReplaceLabels Operation = "bulk_replace_labels" // renames a label across many tickets
-	OpEditOthersNote    Operation = "edit_others_note"    // rewriting another actor's words
-	OpDeleteOthersNote  Operation = "delete_others_note"  //
+	OpChangeItemType    Operation = "change_item_type"       // what a ticket is, after the fact
+	OpReparentItem      Operation = "reparent_item"          // restructures the hierarchy
+	OpRenameProject     Operation = "rename_project"         // changes how a project is shown everywhere
+	OpMoveItem          Operation = "move_item"              // takes tickets out of one project and into another
+	OpDeleteProject     Operation = "delete_project"         // affects every ticket in it
+	OpRestoreProject    Operation = "restore_project"        //
+	OpBulkUpdateStatus  Operation = "bulk_update_status"     // one action, many tickets
+	OpBulkRelate        Operation = "bulk_relate"            //
+	OpTransferOwner     Operation = "transfer_owner"         // moves accountability for a ticket
+	OpManageMembers     Operation = "manage_project_members" // who may work in a project, and as what
+	OpBulkReplaceLabels Operation = "bulk_replace_labels"    // renames a label across many tickets
+	OpEditOthersNote    Operation = "edit_others_note"       // rewriting another actor's words
+	OpDeleteOthersNote  Operation = "delete_others_note"     //
 )
 
 // Target is what the operation acts on. ProjectID is here from the start

@@ -212,3 +212,20 @@ CREATE TABLE IF NOT EXISTS item_labels (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_item_labels_unique ON item_labels(item_id, lower(label)) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_item_labels_item ON item_labels(item_id);
 CREATE INDEX IF NOT EXISTS idx_item_labels_label ON item_labels(lower(label));
+
+-- Project members (2026-11-07, ledger story a94140e8): who may work in a project
+-- and in what role. There is no single owner column on projects; ownership is the
+-- owner role here, so a project can have several owners. member is an identity
+-- "kind:id" (identity.go). Unique per project among live rows, so a removed
+-- member can be added again. role is enforced by a vocabulary trigger.
+CREATE TABLE IF NOT EXISTS project_members (
+  id         TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id),
+  member     TEXT NOT NULL,
+  role       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  created_by TEXT,
+  deleted_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_members_unique ON project_members(project_id, member) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_project_members_member ON project_members(member);
