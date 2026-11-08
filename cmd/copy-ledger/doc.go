@@ -19,7 +19,7 @@
 //   - List every row whose value the ledger's current vocabulary no longer allows (left over
 //     from before the rules existed) instead of failing on the first; leaf rows (relations,
 //     notes, workflow links, members) may be left out with -skip-invalid and are named in the
-//     report; a ticket or workflow is never skipped (exit status 4 when a decision is needed).
+//     report; a ticket or workflow is never skipped (exit status 2 when a decision is needed).
 //   - Read a SQLite source from a snapshot, so the source ledger is never written to.
 //
 // # Non-goals

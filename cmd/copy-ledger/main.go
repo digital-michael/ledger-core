@@ -19,19 +19,16 @@
 // -map-identity person:local=person:remote (repeatable).
 //
 // Exit status: 0 done (or a clean dry run, or a verification that matched), 1 error, 2 a
-// decision about outside links is needed, 3 rows on the target differ from the source (a copy
+// decision is needed (outside links, or rows outside the vocabulary), 3 rows on the target differ from the source (a copy
 // refused), 4 a verification found rows missing or different.
 
 package main
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	ledgercore "github.com/digital-michael/ledger-core"
@@ -84,12 +81,12 @@ func main() {
 	}
 
 	ctx := context.Background()
-	src, cleanup, err := openSource(ctx, *fromDB, *fromDSN)
+	src, cleanup, err := ledgercore.OpenCopySource(ctx, *fromDB, *fromDSN)
 	if err != nil {
 		fail(1, "source: %v", err)
 	}
 	defer cleanup()
-	if sameLedger(*fromDB, *fromDSN, *toDB, *toDSN) {
+	if ledgercore.SameLedger(*fromDB, *fromDSN, *toDB, *toDSN) {
 		fail(1, "the source and the target are the same ledger")
 	}
 	dst, err := ledgercore.Open(ledgercore.Options{Path: *toDB, DSN: *toDSN})
@@ -113,7 +110,7 @@ func main() {
 		handle(err)
 		printVerify(vrep)
 		if !vrep.OK {
-			os.Exit(4)
+			os.Exit(ledgercore.CopyExitVerify)
 		}
 		return
 	}
@@ -127,175 +124,26 @@ func main() {
 		fmt.Println()
 		printVerify(vrep)
 		if !vrep.OK {
-			os.Exit(4)
+			os.Exit(ledgercore.CopyExitVerify)
 		}
 	}
 }
 
 // handle reports the errors that need a person, and exits; a nil error returns.
 func handle(err error) {
-	var cl *ledgercore.CrossLinksError
-	var ce *ledgercore.CopyConflictError
-	var ve *ledgercore.VocabularyError
-	switch {
-	case errors.As(err, &ve):
-		fmt.Printf("%d row(s) hold a value outside the ledger vocabulary, which the target refuses:\n", len(ve.Rows))
-		for _, r := range ve.Rows {
-			fmt.Println("  " + r)
-		}
-		if ve.Skippable {
-			fmt.Println("Nothing was copied. Fix them in the source, or leave them out with -skip-invalid.")
-		} else {
-			fmt.Println("Nothing was copied. Some are tickets or workflows, which cannot be left out: fix them in the source.")
-		}
-		os.Exit(4)
-	case errors.As(err, &cl):
-		fmt.Println("The selection is linked to projects that were not chosen:")
-		for _, l := range cl.Links {
-			fmt.Printf("  %-22s %-28s %-3s %d\n", l.Project, l.Kind, l.Direction, l.Count)
-		}
-		fmt.Println("Nothing was copied. Include some of them with -with-linked name[,name], or leave every")
-		fmt.Println("outside link out with -drop-cross-links. Changing neither cancels.")
-		os.Exit(2)
-	case errors.As(err, &ce):
-		fmt.Printf("%d row(s) on the target differ from the source; a copy never overwrites, so nothing was copied:\n", len(ce.Conflicts))
-		for i, c := range ce.Conflicts {
-			if i == 20 {
-				fmt.Printf("  ... and %d more\n", len(ce.Conflicts)-20)
-				break
-			}
-			fmt.Println("  " + c)
-		}
-		os.Exit(3)
-	case err != nil:
-		fail(1, "%v", err)
+	if err == nil {
+		return
 	}
+	if text, code, ok := ledgercore.CopyDecisionText(err); ok {
+		fmt.Print(text)
+		os.Exit(code)
+	}
+	fail(1, "%v", err)
 }
 
-func printVerify(v *ledgercore.VerifyReport) {
-	fmt.Printf("verifying projects: %s\n\n", strings.Join(v.Projects, ", "))
-	fmt.Printf("%-24s %9s %9s %8s %10s %14s\n", "table", "selected", "matching", "missing", "different", "only on target")
-	for _, t := range v.Tables {
-		if t.Selected == 0 && t.OnlyOnTarget == 0 {
-			continue
-		}
-		fmt.Printf("%-24s %9d %9d %8d %10d %14d\n", t.Table, t.Selected, t.Matching, t.Missing, t.Different, t.OnlyOnTarget)
-	}
-	for _, t := range v.Tables {
-		for _, e := range t.Examples {
-			fmt.Println("  problem: " + e)
-		}
-	}
-	if len(v.Dropped) > 0 {
-		fmt.Println("\nlinks the selection leaves out (not expected on the target):")
-		for _, l := range v.Dropped {
-			fmt.Printf("  %-22s %-28s %-3s %d\n", l.Project, l.Kind, l.Direction, l.Count)
-		}
-	}
-	if len(v.Skipped) > 0 {
-		fmt.Printf("\n%d row(s) left out under -skip-invalid (outside the ledger vocabulary):\n", len(v.Skipped))
-		for _, s := range v.Skipped {
-			fmt.Println("  " + s)
-		}
-	}
-	extra := 0
-	for _, t := range v.Tables {
-		extra += t.OnlyOnTarget
-	}
-	if extra > 0 {
-		fmt.Printf("\n%d row(s) exist only on the target inside these projects (work done there since): information, not a failure.\n", extra)
-	}
-	if v.OK {
-		fmt.Println("\nVERIFIED: every selected row is on the target and identical to the source.")
-	} else {
-		fmt.Println("\nMISMATCH: the target does not hold the selection as the source does (see the problems above).")
-	}
-}
+func printVerify(v *ledgercore.VerifyReport) { fmt.Print(v.Text()) }
 
-func print(rep *ledgercore.CopyReport) {
-	fmt.Printf("projects: %s\n\n", strings.Join(rep.Projects, ", "))
-	fmt.Printf("%-24s %9s %9s %9s %13s\n", "table", "selected", "inserted", "updated", "already there")
-	for _, t := range rep.Tables {
-		if t.Selected == 0 {
-			continue
-		}
-		fmt.Printf("%-24s %9d %9d %9d %13d\n", t.Table, t.Selected, t.Inserted, t.Updated, t.AlreadyThere)
-	}
-	if len(rep.Dropped) > 0 {
-		fmt.Println("\nlinks left out (their other end was not selected):")
-		for _, l := range rep.Dropped {
-			fmt.Printf("  %-22s %-28s %-3s %d\n", l.Project, l.Kind, l.Direction, l.Count)
-		}
-	}
-	if len(rep.Skipped) > 0 {
-		fmt.Println("\nrows left out (outside the ledger vocabulary, -skip-invalid):")
-		for _, s := range rep.Skipped {
-			fmt.Println("  " + s)
-		}
-	}
-	if rep.IdentitiesMapped > 0 {
-		fmt.Printf("\nidentities rewritten: %d\n", rep.IdentitiesMapped)
-	}
-	if rep.Applied {
-		fmt.Println("\ncopied and verified: every row was read back from the target and matches.")
-	} else {
-		fmt.Println("\ndry run: the copy ran in full and was rolled back. Nothing was changed (run with -apply).")
-	}
-}
-
-// openSource opens the source ledger. A SQLite file is read from a snapshot taken with
-// VACUUM INTO, so the source is never written to and never migrated.
-func openSource(ctx context.Context, path, dsn string) (ledgercore.Store, func(), error) {
-	if dsn != "" {
-		s, err := ledgercore.Open(ledgercore.Options{DSN: dsn})
-		return s, func() { s.Close() }, err
-	}
-	if path == "" {
-		p, err := ledgercore.DefaultPath()
-		if err != nil {
-			return nil, nil, err
-		}
-		path = p
-	}
-	if _, err := os.Stat(path); err != nil {
-		return nil, nil, err
-	}
-	dir, err := os.MkdirTemp("", "copy-ledger-")
-	if err != nil {
-		return nil, nil, err
-	}
-	cleanup := func() { os.RemoveAll(dir) }
-	snap := filepath.Join(dir, "snapshot.db")
-	raw, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	_, err = raw.ExecContext(ctx, "VACUUM INTO ?", snap)
-	raw.Close()
-	if err != nil {
-		cleanup()
-		return nil, nil, fmt.Errorf("snapshotting %s: %w", path, err)
-	}
-	s, err := ledgercore.Open(ledgercore.Options{Path: snap})
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
-	return s, func() { s.Close(); cleanup() }, nil
-}
-
-func sameLedger(fromDB, fromDSN, toDB, toDSN string) bool {
-	if fromDSN != "" && fromDSN == toDSN {
-		return true
-	}
-	if fromDB != "" && toDB != "" {
-		a, _ := filepath.Abs(fromDB)
-		b, _ := filepath.Abs(toDB)
-		return a == b
-	}
-	return false
-}
+func print(rep *ledgercore.CopyReport) { fmt.Print(rep.Text()) }
 
 func fail(code int, format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "copy-ledger: "+format+"\n", args...)
