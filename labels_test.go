@@ -488,3 +488,73 @@ func TestLabels_legacyCountHelperReportsMismatch(t *testing.T) {
 		t.Errorf("after the copy the gate should pass: %+v", rep)
 	}
 }
+
+func TestLabels_updateFieldsLabelsSetsTheExactList(t *testing.T) {
+	db := openTest(t)
+	p := mustProject(t, db, "lab")
+	it, _ := db.CreateItem(ctx, CreateItemParams{ProjectID: p.ID, Title: "t", Labels: []string{"a", "b", "c"}})
+
+	set := func(ls ...string) (*Item, error) {
+		return db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Labels: &ls}})
+	}
+	before, _ := db.ListLabels(ctx, it.ID)
+	var bID string
+	for _, r := range before {
+		if r.Label == "b" {
+			bID = r.ID
+		}
+	}
+	got, err := set("b", "D", "d", " e ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Labels, []string{"b", "D", "e"}) {
+		t.Errorf("exact set -> %v", got.Labels)
+	}
+	// "b" was kept, not removed and re-added: it is the same row.
+	after, _ := db.ListLabels(ctx, it.ID)
+	kept := false
+	for _, r := range after {
+		if r.Label == "b" && r.ID == bID && bID != "" {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Error("a label that stayed in the set was rewritten")
+	}
+	// The same set again is a no-op: no new audit rows on the item.
+	n := len(auditRows(t, db, "item", it.ID))
+	if _, err := set("e", "d", "B"); err != nil {
+		t.Fatal(err)
+	}
+	if len(auditRows(t, db, "item", it.ID)) != n {
+		t.Error("an unchanged set wrote audit")
+	}
+	// Empty clears all.
+	if got, err := set(); err != nil || len(got.Labels) != 0 {
+		t.Errorf("clear -> %v %v", got.Labels, err)
+	}
+	// A bad entry rejects the whole edit and changes nothing.
+	set("keep")
+	if _, err := set("ok", ""); err == nil {
+		t.Error("an empty entry should be refused")
+	}
+	if got := labelsOf(t, db, it.ID); !reflect.DeepEqual(got, []string{"keep"}) {
+		t.Errorf("a refused edit changed the labels: %v", got)
+	}
+	// label and labels together are refused.
+	l := "x"
+	ls := []string{"y"}
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Label: &l, Labels: &ls}}); err == nil {
+		t.Error("label with labels accepted")
+	}
+	// Combined with another field, one save is one batch.
+	title := "renamed"
+	ls2 := []string{"z"}
+	if _, err := db.UpdateItemFields(ctx, it.ID, ItemUpdate{Fields: ItemFields{Title: &title, Labels: &ls2}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := labelsOf(t, db, it.ID); !reflect.DeepEqual(got, []string{"z"}) {
+		t.Errorf("combined edit: %v", got)
+	}
+}

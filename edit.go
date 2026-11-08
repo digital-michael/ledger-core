@@ -35,7 +35,8 @@ import (
 type ItemFields struct {
 	Title       *string
 	Description *string
-	Label       *string
+	Label       *string   // replaces the whole label set with this one value ("" clears)
+	Labels      *[]string // replaces the whole label set with exactly these (empty clears); not with Label
 	Component   *string
 	Status      *string
 	Assignee    *string
@@ -56,7 +57,7 @@ type ItemUpdate struct {
 }
 
 func (f ItemFields) empty() bool {
-	return f.Title == nil && f.Description == nil && f.Label == nil && f.Component == nil &&
+	return f.Title == nil && f.Description == nil && f.Label == nil && f.Labels == nil && f.Component == nil &&
 		f.Status == nil && f.Assignee == nil && f.Priority == nil && f.Type == nil
 }
 
@@ -72,6 +73,9 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	}
 	if u.Fields.Type != nil && !validItemTypes[*u.Fields.Type] {
 		return nil, &FieldError{Field: "type", Value: *u.Fields.Type, Allowed: itemTypes}
+	}
+	if u.Fields.Label != nil && u.Fields.Labels != nil {
+		return nil, errors.New("give label or labels, not both")
 	}
 
 	tx, err := db.conn.BeginTx(ctx, nil)
@@ -146,14 +150,20 @@ func (db *DB) UpdateItemFields(ctx context.Context, id string, u ItemUpdate) (*I
 	// Label keeps its meaning: replace the item's whole label set with this one
 	// value ("" clears all). The rows live in item_labels now.
 	labelChanged := false
-	if f.Label != nil {
+	if f.Label != nil || f.Labels != nil {
 		var want []string
-		if strings.TrimSpace(*f.Label) != "" {
+		if f.Label != nil && strings.TrimSpace(*f.Label) != "" {
 			v, err := normalizeLabel(*f.Label)
 			if err != nil {
 				return nil, err
 			}
 			want = []string{v}
+		}
+		if f.Labels != nil {
+			var err error
+			if want, err = normalizeLabels(*f.Labels); err != nil {
+				return nil, err
+			}
 		}
 		changed, before, after, err := db.replaceItemLabelsTx(ctx, tx, id, want, nowUTC())
 		if err != nil {
