@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"embed"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -176,8 +177,25 @@ type SQLiteFactory struct {
 	Options Options
 }
 
-// Open implements Factory.
+// Open implements Factory. A DSN in the options is ignored: this factory is SQLite's,
+// so it cannot hand out a PostgreSQL ledger by accident.
 func (f SQLiteFactory) Open() (Store, error) {
+	opts := f.Options
+	opts.DSN = ""
+	return Open(opts)
+}
+
+// PostgresFactory creates PostgreSQL-backed Store instances. Options.DSN is required;
+// Options.Path is ignored.
+type PostgresFactory struct {
+	Options Options
+}
+
+// Open implements Factory.
+func (f PostgresFactory) Open() (Store, error) {
+	if f.Options.DSN == "" {
+		return nil, errors.New("a PostgreSQL ledger needs a connection string (Options.DSN)")
+	}
 	return Open(f.Options)
 }
 

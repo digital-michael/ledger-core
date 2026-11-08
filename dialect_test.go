@@ -1,6 +1,7 @@
 package ledgercore
 
 import (
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -104,5 +105,43 @@ func TestSQLiteDialect_insertIgnoreKeepsTheFirstRow(t *testing.T) {
 	db.conn.QueryRow(`SELECT COUNT(*), MIN(created_at) FROM project_aliases WHERE alias_key = 'old-key'`).Scan(&n, &created)
 	if n != 1 || created != "2026-01-01T00:00:00.000000000Z" {
 		t.Errorf("rows=%d created=%q", n, created)
+	}
+}
+
+// The two factories each hand out their own kind of ledger, and never the other's.
+func TestFactories_eachOpensItsOwnKind(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	opts := backendOptions(t, path)
+
+	if _, err := (PostgresFactory{Options: Options{Path: path}}).Open(); err == nil {
+		t.Error("a PostgreSQL factory with no DSN opened something")
+	}
+	if onPostgres() {
+		s, err := PostgresFactory{Options: opts}.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if s.(*DB).conn.d.name() != "postgres" {
+			t.Errorf("PostgresFactory opened %s", s.(*DB).conn.d.name())
+		}
+		// Given a DSN, the SQLite factory still opens SQLite (here, a file beside the test).
+		sq, err := SQLiteFactory{Options: Options{Path: filepath.Join(t.TempDir(), "other.db"), DSN: opts.DSN}}.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sq.Close()
+		if sq.(*DB).conn.d.name() != "sqlite" {
+			t.Errorf("SQLiteFactory opened %s", sq.(*DB).conn.d.name())
+		}
+		return
+	}
+	s, err := SQLiteFactory{Options: opts}.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.(*DB).conn.d.name() != "sqlite" {
+		t.Errorf("SQLiteFactory opened %s", s.(*DB).conn.d.name())
 	}
 }
