@@ -108,8 +108,7 @@ func wantErrContaining(t *testing.T, err error, substr string) {
 // Opening the database
 // ---------------------------------------------------------------------------
 
-// The ledger's location must never move: every program opening it has to
-// resolve the same file, or a new build silently starts on an empty database.
+// Every program opening the ledger has to resolve the same file, or it silently starts on an empty database.
 func TestDefaultPathResolution(t *testing.T) {
 	t.Setenv("LEDGER_DB_PATH", "/explicit/ledger.db")
 	if p, _ := DefaultPath(); p != "/explicit/ledger.db" {
@@ -117,15 +116,53 @@ func TestDefaultPathResolution(t *testing.T) {
 	}
 
 	t.Setenv("LEDGER_DB_PATH", "")
+	t.Setenv("DATUM_DATA_DIR", "")
 	t.Setenv("XDG_DATA_HOME", "/xdg")
-	if p, _ := DefaultPath(); p != "/xdg/mcp-local/ledger.db" {
+	if p, _ := DefaultPath(); p != "/xdg/photon-datum/ledger/ledger.db" {
 		t.Errorf("XDG_DATA_HOME: got %q", p)
 	}
 
 	t.Setenv("XDG_DATA_HOME", "")
 	t.Setenv("HOME", "/home/someone")
-	if p, _ := DefaultPath(); p != "/home/someone/.local/share/mcp-local/ledger.db" {
-		t.Errorf("home fallback: got %q", p)
+	if p, _ := DefaultPath(); p != "/home/someone/.local/share/photon-datum/ledger/ledger.db" {
+		t.Errorf("home default: got %q", p)
+	}
+
+	t.Setenv("DATUM_DATA_DIR", "/datum/data")
+	if p, _ := DefaultPath(); p != "/datum/data/ledger/ledger.db" {
+		t.Errorf("DATUM_DATA_DIR: got %q", p)
+	}
+}
+
+// The tripwire: while the ledger is still at its old place and not at the new one, DefaultPath refuses instead of letting a program
+// create an empty database. Once the file is at the new place, or LEDGER_DB_PATH names one, it answers.
+func TestDefaultPathRefusesAnEmptyDatabaseNextToTheRealOne(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("DATUM_DATA_DIR", "")
+	t.Setenv("LEDGER_DB_PATH", "")
+	old := filepath.Join(home, ".local", "share", "mcp-local")
+	if err := os.MkdirAll(old, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(old, "ledger.db"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := DefaultPath(); err == nil {
+		t.Fatalf("the old file exists and the new one does not: want an error, got %q", p)
+	} else if !strings.Contains(err.Error(), "migrate-paths.sh") {
+		t.Errorf("the error must say how to move it: %v", err)
+	}
+	nu := filepath.Join(home, ".local", "share", "photon-datum", "ledger")
+	if err := os.MkdirAll(nu, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nu, "ledger.db"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := DefaultPath(); err != nil || p != filepath.Join(nu, "ledger.db") {
+		t.Errorf("once moved: %q, %v", p, err)
 	}
 }
 

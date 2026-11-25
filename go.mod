@@ -3,6 +3,7 @@ module github.com/digital-michael/ledger-core
 go 1.25.5
 
 require (
+	github.com/digital-michael/config-core v0.0.0-20261125124824-edea68a2c53d
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.12.0
 	modernc.org/sqlite v1.55.0

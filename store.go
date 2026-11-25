@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	configcore "github.com/digital-michael/config-core"
 	_ "modernc.org/sqlite"
 )
 
@@ -206,28 +207,52 @@ type DB struct {
 	policy func(context.Context, Actor, Operation, Target) error
 }
 
-// DefaultPath resolves the ledger SQLite file location.
-// Uses LEDGER_DB_PATH if set; otherwise $XDG_DATA_HOME/mcp-local/ledger.db,
-// falling back to ~/.local/share/mcp-local/ledger.db if XDG_DATA_HOME is unset.
+// DefaultPath resolves the ledger SQLite file location: LEDGER_DB_PATH if set; otherwise ledger/ledger.db in the data folder of the
+// Photon Datum layout (config-core: $XDG_DATA_HOME/photon-datum/ledger/ledger.db, else ~/.local/share/photon-datum/ledger/ledger.db).
 //
-// The "mcp-local" directory name is historical -- the ledger lived inside
-// mcp-local when this path was chosen -- and is kept deliberately: every
-// program that opens the ledger must resolve the SAME file, and renaming the
-// directory would silently point new builds at an empty database while the
-// real data sat untouched at the old path.
+// The ledger is a first-class store that several programs open (ledger-server, mcp-local, the agent probe), so it is a folder of its
+// own and not under any one program's. Every program that opens the ledger must resolve the SAME file.
+//
+// TRIPWIRE (remove once every machine has been migrated): the ledger used to live at ~/.local/share/mcp-local/ledger.db. A build that
+// looked only at the new path would silently create an EMPTY database next to the real one, so while the old file exists and the new
+// one does not, DefaultPath fails and says how to move it (datum-core/stack/scripts/migrate-paths.sh). This is not a fallback: nothing
+// is ever read from the old path.
 func DefaultPath() (string, error) {
 	if p := os.Getenv("LEDGER_DB_PATH"); p != "" {
 		return p, nil
 	}
+	p, err := ledgerLayout.Path(configcore.Current(), configcore.Data, ledgerPathParts...)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(p); os.IsNotExist(err) {
+		if old := legacyDefaultPath(); old != "" {
+			if _, err := os.Stat(old); err == nil {
+				return "", fmt.Errorf("the ledger is still at %s and is expected at %s: run datum-core/stack/scripts/migrate-paths.sh (or set LEDGER_DB_PATH)", old, p)
+			}
+		}
+	}
+	return p, nil
+}
+
+// The ledger's place in the layout. If the ledger is split out as a product of its own, set ledgerLayout to a Layout with its own root
+// and environment prefix and ledgerPathParts to just its file name: no program outside the ledger changes.
+var (
+	ledgerLayout    = configcore.PhotonDatum
+	ledgerPathParts = []string{configcore.LedgerName, configcore.LedgerFileName}
+)
+
+// legacyDefaultPath is where the ledger lived before the photon-datum layout (see the tripwire above).
+func legacyDefaultPath() string {
 	base := os.Getenv("XDG_DATA_HOME")
 	if base == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("resolving home directory: %w", err)
+			return ""
 		}
 		base = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(base, "mcp-local", "ledger.db"), nil
+	return filepath.Join(base, "mcp-local", "ledger.db")
 }
 
 // Open opens the ledger at opts.Path (or DefaultPath() if empty).

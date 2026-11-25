@@ -1,7 +1,7 @@
 // Usage notes for copy-ledger.
 //
 //	# rehearse: report what would be copied, change nothing
-//	copy-ledger -from-db ~/.local/share/mcp-local/ledger.db -to-dsn 'postgres://u:p@host/db' -project website
+//	copy-ledger -from-db ~/.local/share/photon-datum/ledger/ledger.db -to-dsn 'postgres://u:p@host/db' -project website
 //
 //	# the selection is linked to other projects: the tool stops and names them. Then either
 //	copy-ledger ... -project website -with-linked mcp-local,membership   # include these
@@ -48,7 +48,7 @@ func (l *listFlag) Set(v string) error {
 
 func main() {
 	var projects, plans, workflows, withLinked, maps listFlag
-	fromDB := flag.String("from-db", "", "source SQLite ledger file (default: LEDGER_DB_PATH, else ~/.local/share/mcp-local/ledger.db)")
+	fromDB := flag.String("from-db", "", "source SQLite ledger file (default: LEDGER_DB_PATH, else ~/.local/share/photon-datum/ledger/ledger.db)")
 	fromDSN := flag.String("from-dsn", "", "source PostgreSQL connection string, instead of -from-db")
 	toDB := flag.String("to-db", "", "target SQLite ledger file")
 	toDSN := flag.String("to-dsn", "", "target PostgreSQL connection string")

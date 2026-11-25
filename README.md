@@ -40,7 +40,7 @@ here.
 | | |
 |---|---|
 | Owns | The ledger schema and its migrations; every read and write of ledger data; the vocabulary and the storage triggers that enforce it; the identity format; the audit trail |
-| Depends on | `modernc.org/sqlite` (a pure Go SQLite driver), `github.com/jackc/pgx/v5` (a pure Go PostgreSQL driver) and `github.com/google/uuid` |
+| Depends on | `modernc.org/sqlite` (a pure Go SQLite driver), `github.com/jackc/pgx/v5` (a pure Go PostgreSQL driver), `github.com/google/uuid` and `config-core` (where the database lives; standard library only) |
 | Used by | `mcp-local`, through a thin adapter that supplies the calling MCP client's name; `ledger-server`, the web UI |
 
 ## Layout
@@ -95,7 +95,7 @@ cross-process locking is what is under test.
 import ledgercore "github.com/digital-michael/ledger-core"
 
 store, err := ledgercore.Open(ledgercore.Options{
-    // Path: "" means DefaultPath(): LEDGER_DB_PATH, else ~/.local/share/mcp-local/ledger.db
+    // Path: "" means DefaultPath(): LEDGER_DB_PATH, else ~/.local/share/photon-datum/ledger/ledger.db
     // DSN: "postgres://user:pass@host/db" opens PostgreSQL instead, and Path is ignored.
     Actor: func(ctx context.Context) ledgercore.Actor {
         return ledgercore.Actor{Kind: ledgercore.ActorProgram, ID: "my-program"} // recorded on every audit row
@@ -110,9 +110,12 @@ roles, so a caller can offer only valid choices.
 
 These hold because something went wrong once. Do not change them casually.
 
-- **The default path stays `~/.local/share/mcp-local/ledger.db`.** The `mcp-local` directory name
-  is historical. Every program must open the same file; renaming it would point new builds at an
-  empty database.
+- **Every program must open the same file.** The default is `ledger/ledger.db` in the data folder of the
+  Photon Datum layout (`~/.local/share/photon-datum/ledger/ledger.db`, from `config-core`); it used to be
+  `~/.local/share/mcp-local/ledger.db`. A build that looked at only one of the two would silently start on an
+  empty database, so while the old file exists and the new one does not, `DefaultPath` fails and names
+  `migrate-paths.sh` (a tripwire, removed once every machine is migrated). If the ledger is split out as a
+  product, `ledgerLayout` in `store.go` is the one place to change.
 - **Pragmas are set in the DSN, never with `Exec()` after opening.** `busy_timeout` must apply to
   every pooled connection and before the first `Ping()`. Without it, 923 of 1000 concurrent writes
   failed (measured 2026-09-07).

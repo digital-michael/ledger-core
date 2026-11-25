@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	path := flag.String("db", "", "ledger database (default: LEDGER_DB_PATH, else ~/.local/share/mcp-local/ledger.db)")
+	path := flag.String("db", "", "ledger database (default: LEDGER_DB_PATH, else ~/.local/share/photon-datum/ledger/ledger.db)")
 	owner := flag.String("owner", "person:digital-michael", "the person who owns everything that has no owner yet")
 	apply := flag.Bool("apply", false, "make the changes (default: report only)")
 	flag.Parse()

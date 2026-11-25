@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	path := flag.String("db", "", "ledger database (default: LEDGER_DB_PATH, else ~/.local/share/mcp-local/ledger.db)")
+	path := flag.String("db", "", "ledger database (default: LEDGER_DB_PATH, else ~/.local/share/photon-datum/ledger/ledger.db)")
 	apply := flag.Bool("apply", false, "rewrite the stamps (default: report only)")
 	flag.Parse()
 

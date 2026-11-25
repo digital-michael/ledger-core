@@ -12,7 +12,7 @@
 
 set -u
 
-LIVE="${1:-${LEDGER_DB_PATH:-$HOME/.local/share/mcp-local/ledger.db}}"
+LIVE="${1:-${LEDGER_DB_PATH:-$HOME/.local/share/photon-datum/ledger/ledger.db}}"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
 if [ ! -f "$LIVE" ]; then
