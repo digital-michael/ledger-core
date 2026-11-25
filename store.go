@@ -250,7 +250,7 @@ func legacyDefaultPath() string {
 		if err != nil {
 			return ""
 		}
-		base = filepath.Join(home, ".local", "share")
+		base = filepath.Join(home, ".local", "share") // path-ok: the old place, guarded by the tripwire above
 	}
 	return filepath.Join(base, "mcp-local", "ledger.db")
 }
